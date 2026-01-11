@@ -660,19 +660,29 @@ func isLossySource(ext string, codec string) bool {
 
 // CONVERSION FEATURE: Build ffmpeg arguments for desired target.
 func buildFFmpegArgs(ffmpegPath, inPath, outPath, targetFmt, extraArgs string) ([]string, error) {
-	args := []string{"-y", "-i", inPath, "-vn"}
+	args := []string{"-y", "-i", inPath}
 	switch targetFmt {
 	case "flac":
-		args = append(args, "-c:a", "flac")
+		args = append(args,
+			"-map", "0:a",
+			"-map", "0:v?",
+			"-c:a", "flac",
+			"-c:v", "copy",
+			"-disposition:v", "attached_pic",
+		)
 	case "mp3":
+		args = append(args, "-vn")
 		// VBR quality 2 ~ high quality
 		args = append(args, "-c:a", "libmp3lame", "-qscale:a", "2")
 	case "opus":
+		args = append(args, "-vn")
 		// Medium/high quality
 		args = append(args, "-c:a", "libopus", "-b:a", "192k", "-vbr", "on")
 	case "wav":
+		args = append(args, "-vn")
 		args = append(args, "-c:a", "pcm_s16le")
 	case "copy":
+		args = append(args, "-vn")
 		// Just container copy (probably pointless for same container)
 		args = append(args, "-c", "copy")
 	default:
@@ -2573,14 +2583,16 @@ type TelegramBot struct {
 }
 
 type PendingSelection struct {
-	Kind      string
-	Items     []SearchResultItem
-	CreatedAt time.Time
+	Kind             string
+	Items            []SearchResultItem
+	CreatedAt        time.Time
+	ReplyToMessageID int
 }
 
 type Update struct {
-	UpdateID int      `json:"update_id"`
-	Message  *Message `json:"message,omitempty"`
+	UpdateID      int            `json:"update_id"`
+	Message       *Message       `json:"message,omitempty"`
+	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
 }
 
 type Message struct {
@@ -2588,6 +2600,13 @@ type Message struct {
 	From      *User  `json:"from,omitempty"`
 	Chat      Chat   `json:"chat"`
 	Text      string `json:"text,omitempty"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    *User    `json:"from,omitempty"`
+	Message *Message `json:"message,omitempty"`
+	Data    string   `json:"data,omitempty"`
 }
 
 type User struct {
@@ -2598,6 +2617,15 @@ type User struct {
 type Chat struct {
 	ID   int64  `json:"id"`
 	Type string `json:"type"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
 }
 
 type ReplyKeyboardMarkup struct {
@@ -2683,6 +2711,8 @@ func (b *TelegramBot) loop() {
 			}
 			if upd.Message != nil {
 				b.handleMessage(upd.Message)
+			} else if upd.CallbackQuery != nil {
+				b.handleCallback(upd.CallbackQuery)
 			}
 		}
 	}
@@ -2698,32 +2728,45 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 	}
 	text := strings.TrimSpace(msg.Text)
 	if cmd, args, ok := parseCommand(text); ok {
-		b.handleCommand(msg.Chat.ID, cmd, args)
-		return
-	}
-	if n, err := strconv.Atoi(text); err == nil {
-		b.handleSelection(msg.Chat.ID, n)
+		b.handleCommand(msg.Chat.ID, cmd, args, msg.MessageID)
 		return
 	}
 }
 
-func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string) {
+func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
+	if cb == nil || cb.Message == nil {
+		return
+	}
+	if !b.isAllowedChat(cb.Message.Chat.ID) {
+		return
+	}
+	data := strings.TrimSpace(cb.Data)
+	if strings.HasPrefix(data, "sel:") {
+		numStr := strings.TrimPrefix(data, "sel:")
+		if n, err := strconv.Atoi(numStr); err == nil {
+			b.handleSelection(cb.Message.Chat.ID, n)
+		}
+	}
+	_ = b.answerCallbackQuery(cb.ID)
+}
+
+func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, replyToID int) {
 	switch cmd {
 	case "start", "help":
 		_ = b.sendMessage(chatID, botHelpText(), nil)
 	case "search_song":
-		b.handleSearch(chatID, "song", strings.Join(args, " "))
+		b.handleSearch(chatID, "song", strings.Join(args, " "), replyToID)
 	case "search_album":
-		b.handleSearch(chatID, "album", strings.Join(args, " "))
+		b.handleSearch(chatID, "album", strings.Join(args, " "), replyToID)
 	case "search_artist":
-		b.handleSearch(chatID, "artist", strings.Join(args, " "))
+		b.handleSearch(chatID, "artist", strings.Join(args, " "), replyToID)
 	case "search":
 		if len(args) < 2 {
-			_ = b.sendMessage(chatID, "Usage: /search <song|album|artist> <keywords>", nil)
+			_ = b.sendMessageWithReply(chatID, "Usage: /search <song|album|artist> <keywords>", nil, replyToID)
 			return
 		}
 		kind := strings.ToLower(args[0])
-		b.handleSearch(chatID, kind, strings.Join(args[1:], " "))
+		b.handleSearch(chatID, kind, strings.Join(args[1:], " "), replyToID)
 	case "id":
 		if len(args) == 0 {
 			_ = b.sendMessage(chatID, "Usage: /id <song|album> <id>", nil)
@@ -2758,31 +2801,31 @@ func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string) {
 	}
 }
 
-func (b *TelegramBot) handleSearch(chatID int64, kind string, query string) {
+func (b *TelegramBot) handleSearch(chatID int64, kind string, query string, replyToID int) {
 	query = strings.TrimSpace(query)
 	if query == "" {
-		_ = b.sendMessage(chatID, "Please provide a search query.", nil)
+		_ = b.sendMessageWithReply(chatID, "Please provide a search query.", nil, replyToID)
 		return
 	}
 	kind = strings.ToLower(kind)
 	if kind != "song" && kind != "album" && kind != "artist" {
-		_ = b.sendMessage(chatID, "Search type must be song, album, or artist.", nil)
+		_ = b.sendMessageWithReply(chatID, "Search type must be song, album, or artist.", nil, replyToID)
 		return
 	}
 	apiType := kind + "s"
 	resp, err := ampapi.Search(Config.Storefront, query, apiType, Config.Language, b.appleToken, b.searchLimit, 0)
 	if err != nil {
-		_ = b.sendMessage(chatID, fmt.Sprintf("Search failed: %v", err), nil)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Search failed: %v", err), nil, replyToID)
 		return
 	}
 	items := buildSearchItems(kind, resp)
 	if len(items) == 0 {
-		_ = b.sendMessage(chatID, "No results found.", nil)
+		_ = b.sendMessageWithReply(chatID, "No results found.", nil, replyToID)
 		return
 	}
-	b.setPending(chatID, kind, items)
+	b.setPending(chatID, kind, items, replyToID)
 	message := formatSearchResults(kind, query, items)
-	_ = b.sendMessage(chatID, message, buildNumberKeyboard(len(items)))
+	_ = b.sendMessageWithReply(chatID, message, buildInlineKeyboard(len(items)), replyToID)
 }
 
 func buildSearchItems(kind string, resp *ampapi.SearchResp) []SearchResultItem {
@@ -2844,38 +2887,39 @@ func (b *TelegramBot) handleSelection(chatID int64, choice int) {
 		_ = b.sendMessage(chatID, "No active selection. Start with /search_song or /search_album.", nil)
 		return
 	}
+	replyToID := pending.ReplyToMessageID
 	if time.Since(pending.CreatedAt) > pendingTTL {
 		b.clearPending(chatID)
-		_ = b.sendMessage(chatID, "Selection expired. Please search again.", nil)
+		_ = b.sendMessageWithReply(chatID, "Selection expired. Please search again.", nil, replyToID)
 		return
 	}
 	if choice < 1 || choice > len(pending.Items) {
-		_ = b.sendMessage(chatID, "Selection out of range.", nil)
+		_ = b.sendMessageWithReply(chatID, "Selection out of range.", nil, replyToID)
 		return
 	}
 	selected := pending.Items[choice-1]
 	switch pending.Kind {
 	case "song":
 		b.clearPending(chatID)
-		_ = b.sendMessage(chatID, fmt.Sprintf("Downloading: %s", selected.Name), removeKeyboard())
-		b.queueDownloadSong(chatID, selected.ID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Downloading: %s", selected.Name), nil, replyToID)
+		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID)
 	case "album":
 		b.clearPending(chatID)
-		_ = b.sendMessage(chatID, fmt.Sprintf("Downloading album: %s", selected.Name), removeKeyboard())
-		b.queueDownloadAlbum(chatID, selected.ID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Downloading album: %s", selected.Name), nil, replyToID)
+		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
 		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit)
 		if err != nil {
-			_ = b.sendMessage(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil)
+			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
 			return
 		}
 		if len(albums) == 0 {
-			_ = b.sendMessage(chatID, "No albums found for this artist.", nil)
+			_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
 			return
 		}
-		b.setPending(chatID, "album", albums)
+		b.setPending(chatID, "album", albums, replyToID)
 		message := formatArtistAlbums(selected.Name, albums)
-		_ = b.sendMessage(chatID, message, buildNumberKeyboard(len(albums)))
+		_ = b.sendMessageWithReply(chatID, message, buildInlineKeyboard(len(albums)), replyToID)
 	default:
 		b.clearPending(chatID)
 	}
@@ -2940,28 +2984,36 @@ func fetchArtistAlbums(storefront, artistID, token string, limit int) ([]SearchR
 }
 
 func (b *TelegramBot) queueDownloadSong(chatID int64, songID string) {
+	b.queueDownloadSongWithReply(chatID, songID, 0)
+}
+
+func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, songID string, replyToID int) {
 	if songID == "" {
 		_ = b.sendMessage(chatID, "Song ID is empty.", nil)
 		return
 	}
 	go b.runDownload(chatID, func() error {
 		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken)
-	}, true)
+	}, true, replyToID)
 }
 
 func (b *TelegramBot) queueDownloadAlbum(chatID int64, albumID string) {
+	b.queueDownloadAlbumWithReply(chatID, albumID, 0)
+}
+
+func (b *TelegramBot) queueDownloadAlbumWithReply(chatID int64, albumID string, replyToID int) {
 	if albumID == "" {
 		_ = b.sendMessage(chatID, "Album ID is empty.", nil)
 		return
 	}
 	go b.runDownload(chatID, func() error {
 		return ripAlbum(albumID, b.appleToken, Config.Storefront, Config.MediaUserToken, "")
-	}, false)
+	}, false, replyToID)
 }
 
-func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool) {
+func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, replyToID int) {
 	if !b.tryAcquireDownload() {
-		_ = b.sendMessage(chatID, "Another download is in progress. Please try again shortly.", nil)
+		_ = b.sendMessageWithReply(chatID, "Another download is in progress. Please try again shortly.", nil, replyToID)
 		return
 	}
 	defer b.releaseDownload()
@@ -2985,14 +3037,14 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool) {
 	Config.ConvertSkipLossyToLossless = false
 
 	if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
-		_ = b.sendMessage(chatID, fmt.Sprintf("ffmpeg not found at '%s'.", Config.FFmpegPath), nil)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("ffmpeg not found at '%s'.", Config.FFmpegPath), nil, replyToID)
 		dl_song = false
 		return
 	}
 
 	err := fn()
 	if err != nil {
-		_ = b.sendMessage(chatID, fmt.Sprintf("Download failed: %v", err), nil)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Download failed: %v", err), nil, replyToID)
 		dl_song = false
 		return
 	}
@@ -3000,21 +3052,22 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool) {
 
 	paths := append([]string{}, lastDownloadedPaths...)
 	if len(paths) == 0 {
-		_ = b.sendMessage(chatID, "No files were downloaded.", nil)
+		_ = b.sendMessageWithReply(chatID, "No files were downloaded.", nil, replyToID)
 		return
 	}
 	for _, path := range paths {
-		if err := b.sendAudioFile(chatID, path); err != nil {
-			_ = b.sendMessage(chatID, fmt.Sprintf("Failed to send audio: %v", err), nil)
+		if err := b.sendAudioFile(chatID, path, replyToID); err != nil {
+			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to send audio: %v", err), nil, replyToID)
 		}
 	}
 }
 
-func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
+func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int) error {
 	if strings.ToLower(filepath.Ext(filePath)) != ".flac" {
 		return fmt.Errorf("output is not FLAC: %s", filepath.Base(filePath))
 	}
 	sendPath := filePath
+	displayName := filepath.Base(filePath)
 	cleanup := func() {}
 	defer cleanup()
 
@@ -3023,7 +3076,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
 		return err
 	}
 	if info.Size() > b.maxFileBytes {
-		_ = b.sendMessage(chatID, fmt.Sprintf("File exceeds %dMB, compressing...", b.maxFileBytes/1024/1024), nil)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("File exceeds %dMB, compressing...", b.maxFileBytes/1024/1024), nil, replyToID)
 		compressedPath, err := b.compressFlacToSize(sendPath, b.maxFileBytes)
 		if err != nil {
 			return err
@@ -3051,7 +3104,12 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
 	if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
 	}
-	part, err := writer.CreateFormFile("audio", filepath.Base(sendPath))
+	if replyToID > 0 {
+		if err := writer.WriteField("reply_to_message_id", strconv.Itoa(replyToID)); err != nil {
+			return err
+		}
+	}
+	part, err := writer.CreateFormFile("audio", displayName)
 	if err != nil {
 		return err
 	}
@@ -3086,8 +3144,12 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
 }
 
 func (b *TelegramBot) compressFlacToSize(srcPath string, maxBytes int64) (string, error) {
-	outPath := makeTempFlacPath(srcPath)
+	outPath, err := makeTempFlacPath()
+	if err != nil {
+		return "", err
+	}
 	if err := runFlacCompress(srcPath, outPath, 0, 0, false); err != nil {
+		_ = os.Remove(outPath)
 		return "", err
 	}
 	info, err := os.Stat(outPath)
@@ -3128,7 +3190,14 @@ func (b *TelegramBot) compressFlacToSize(srcPath string, maxBytes int64) (string
 }
 
 func runFlacCompress(srcPath, outPath string, sampleRate int, channels int, force16 bool) error {
-	args := []string{"-y", "-i", srcPath, "-vn", "-c:a", "flac", "-compression_level", "12"}
+	args := []string{"-y", "-i", srcPath,
+		"-map", "0:a",
+		"-map", "0:v?",
+		"-c:a", "flac",
+		"-c:v", "copy",
+		"-disposition:v", "attached_pic",
+		"-compression_level", "12",
+	}
 	if force16 {
 		args = append(args, "-sample_fmt", "s16")
 	}
@@ -3167,15 +3236,16 @@ func pickSampleRate(target float64) int {
 	return rates[len(rates)-1]
 }
 
-func makeTempFlacPath(srcPath string) string {
-	base := strings.TrimSuffix(srcPath, filepath.Ext(srcPath))
-	outPath := base + ".tg.flac"
-	for i := 1; ; i++ {
-		if _, err := os.Stat(outPath); os.IsNotExist(err) {
-			return outPath
-		}
-		outPath = fmt.Sprintf("%s.tg%d.flac", base, i)
+func makeTempFlacPath() (string, error) {
+	tmp, err := os.CreateTemp("", "amdl-*.flac")
+	if err != nil {
+		return "", err
 	}
+	path := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func getAudioDurationSeconds(path string) (float64, error) {
@@ -3206,12 +3276,19 @@ func getAudioDurationSeconds(path string) (float64, error) {
 }
 
 func (b *TelegramBot) sendMessage(chatID int64, text string, markup any) error {
+	return b.sendMessageWithReply(chatID, text, markup, 0)
+}
+
+func (b *TelegramBot) sendMessageWithReply(chatID int64, text string, markup any, replyToID int) error {
 	payload := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
 	}
 	if markup != nil {
 		payload["reply_markup"] = markup
+	}
+	if replyToID > 0 {
+		payload["reply_to_message_id"] = replyToID
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -3237,6 +3314,30 @@ func (b *TelegramBot) sendMessage(chatID int64, text string, markup any) error {
 	if !apiResp.OK {
 		return fmt.Errorf("telegram sendMessage error: %s", apiResp.Description)
 	}
+	return nil
+}
+
+func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
+	if callbackID == "" {
+		return nil
+	}
+	payload := map[string]any{
+		"callback_query_id": callbackID,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("answerCallbackQuery"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 	return nil
 }
 
@@ -3280,13 +3381,14 @@ func (b *TelegramBot) isAllowedChat(chatID int64) bool {
 	return b.allowedChats[chatID]
 }
 
-func (b *TelegramBot) setPending(chatID int64, kind string, items []SearchResultItem) {
+func (b *TelegramBot) setPending(chatID int64, kind string, items []SearchResultItem, replyToID int) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	b.pending[chatID] = &PendingSelection{
-		Kind:      kind,
-		Items:     items,
-		CreatedAt: time.Now(),
+		Kind:             kind,
+		Items:            items,
+		CreatedAt:        time.Now(),
+		ReplyToMessageID: replyToID,
 	}
 }
 
@@ -3360,29 +3462,26 @@ func formatArtistAlbums(artistName string, items []SearchResultItem) string {
 	return strings.TrimSpace(b.String())
 }
 
-func buildNumberKeyboard(count int) ReplyKeyboardMarkup {
+func buildInlineKeyboard(count int) InlineKeyboardMarkup {
 	rowSize := 4
-	rows := [][]KeyboardButton{}
-	row := []KeyboardButton{}
+	rows := [][]InlineKeyboardButton{}
+	row := []InlineKeyboardButton{}
 	for i := 1; i <= count; i++ {
-		row = append(row, KeyboardButton{Text: strconv.Itoa(i)})
+		row = append(row, InlineKeyboardButton{
+			Text:         strconv.Itoa(i),
+			CallbackData: fmt.Sprintf("sel:%d", i),
+		})
 		if len(row) == rowSize {
 			rows = append(rows, row)
-			row = []KeyboardButton{}
+			row = []InlineKeyboardButton{}
 		}
 	}
 	if len(row) > 0 {
 		rows = append(rows, row)
 	}
-	return ReplyKeyboardMarkup{
-		Keyboard:        rows,
-		ResizeKeyboard:  true,
-		OneTimeKeyboard: true,
+	return InlineKeyboardMarkup{
+		InlineKeyboard: rows,
 	}
-}
-
-func removeKeyboard() ReplyKeyboardRemove {
-	return ReplyKeyboardRemove{RemoveKeyboard: true}
 }
 
 func botHelpText() string {
