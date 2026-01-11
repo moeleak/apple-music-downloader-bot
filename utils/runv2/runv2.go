@@ -114,6 +114,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	req.Header = header
 
 	var body io.Reader
+	usedDownloadProgress := false
 	client := &http.Client{Timeout: timeout}
 	if optstimeout > 0 {
 		// create the timer before calling Do so that the timeout covers TCP handshake,
@@ -136,9 +137,10 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 			return err
 		}
 		defer do.Body.Close()
-		if do.ContentLength < int64(Config.MaxMemoryLimit * 1024 * 1024) {
+		if do.ContentLength < int64(Config.MaxMemoryLimit*1024*1024) {
 			var buffer bytes.Buffer
 			if progress != nil {
+				usedDownloadProgress = true
 				pw := &progressWriter{
 					cb:    progress,
 					phase: "Downloading",
@@ -185,7 +187,11 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	//fmt.Print("Decrypting...\n")
 	defer Close(conn)
 
-	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config, progress)
+	phase := "Downloading"
+	if usedDownloadProgress {
+		phase = "Decrypting"
+	}
+	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config, progress, phase)
 	if err != nil {
 		return err
 	}
@@ -194,7 +200,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 }
 
 func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
-	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet, progress ProgressFunc) error {
+	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet, progress ProgressFunc, phase string) error {
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
@@ -234,6 +240,9 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 	// 'segment' in m3u8 == 'fragment' in mp4ff
 	//fmt.Println("Starting decryption...")
 	var bar *progressbar.ProgressBar
+	if phase == "" {
+		phase = "Downloading"
+	}
 	if progress == nil {
 		bar = progressbar.NewOptions64(totalLen,
 			progressbar.OptionClearOnFinish(),
@@ -254,7 +263,7 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 		)
 		bar.Add64(int64(offset))
 	} else {
-		progress("Downloading", int64(offset), totalLen)
+		progress(phase, int64(offset), totalLen)
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	for i := 0; ; i++ {
@@ -300,7 +309,7 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 			return err
 		}
 		if progress != nil {
-			progress("Downloading", int64(offset), totalLen)
+			progress(phase, int64(offset), totalLen)
 		} else {
 			bar.Add64(int64(rawoffset))
 		}
