@@ -49,7 +49,7 @@
 
 注意：
 - 机器人会发送 FLAC，需要系统有 `ffmpeg`。
-- 大文件可能超过 Telegram 限制，可调整 `telegram-max-file-mb`。
+- 超过限制的文件会重新压缩到 `telegram-max-file-mb`（音质可能下降）。
 
 ## 下载歌词
 

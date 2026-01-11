@@ -64,5 +64,5 @@ convert-skip-lossy-to-lossless: true # If true, skip converting detected lossy s
 telegram-bot-token: ""            # Bot token or set TELEGRAM_BOT_TOKEN
 telegram-allowed-chat-ids: []     # Optional chat ID allowlist
 telegram-search-limit: 8          # Results per search
-telegram-max-file-mb: 80          # Max file size to send
+telegram-max-file-mb: 50          # Max file size to send
 telegram-download-folder: ""      # Optional override for downloads

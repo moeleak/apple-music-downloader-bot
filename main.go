@@ -2654,7 +2654,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	}
 	maxFileBytes := int64(Config.TelegramMaxFileMB) * 1024 * 1024
 	if maxFileBytes <= 0 {
-		maxFileBytes = 49 * 1024 * 1024
+		maxFileBytes = 50 * 1024 * 1024
 	}
 	return &TelegramBot{
 		token:        token,
@@ -2982,6 +2982,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool) {
 	Config.ConvertAfterDownload = true
 	Config.ConvertFormat = "flac"
 	Config.ConvertKeepOriginal = false
+	Config.ConvertSkipLossyToLossless = false
 
 	if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
 		_ = b.sendMessage(chatID, fmt.Sprintf("ffmpeg not found at '%s'.", Config.FFmpegPath), nil)
@@ -3013,14 +3014,33 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
 	if strings.ToLower(filepath.Ext(filePath)) != ".flac" {
 		return fmt.Errorf("output is not FLAC: %s", filepath.Base(filePath))
 	}
-	info, err := os.Stat(filePath)
+	sendPath := filePath
+	cleanup := func() {}
+	defer cleanup()
+
+	info, err := os.Stat(sendPath)
 	if err != nil {
 		return err
 	}
 	if info.Size() > b.maxFileBytes {
-		return fmt.Errorf("file too large for Telegram: %s", info.Name())
+		_ = b.sendMessage(chatID, fmt.Sprintf("File exceeds %dMB, compressing...", b.maxFileBytes/1024/1024), nil)
+		compressedPath, err := b.compressFlacToSize(sendPath, b.maxFileBytes)
+		if err != nil {
+			return err
+		}
+		sendPath = compressedPath
+		cleanup = func() {
+			_ = os.Remove(compressedPath)
+		}
+		info, err = os.Stat(sendPath)
+		if err != nil {
+			return err
+		}
+		if info.Size() > b.maxFileBytes {
+			return fmt.Errorf("compressed file still too large: %s", filepath.Base(sendPath))
+		}
 	}
-	file, err := os.Open(filePath)
+	file, err := os.Open(sendPath)
 	if err != nil {
 		return err
 	}
@@ -3031,7 +3051,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
 	if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
 		return err
 	}
-	part, err := writer.CreateFormFile("audio", filepath.Base(filePath))
+	part, err := writer.CreateFormFile("audio", filepath.Base(sendPath))
 	if err != nil {
 		return err
 	}
@@ -3063,6 +3083,126 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
 		return fmt.Errorf("telegram sendAudio error: %s", apiResp.Description)
 	}
 	return nil
+}
+
+func (b *TelegramBot) compressFlacToSize(srcPath string, maxBytes int64) (string, error) {
+	outPath := makeTempFlacPath(srcPath)
+	if err := runFlacCompress(srcPath, outPath, 0, 0, false); err != nil {
+		return "", err
+	}
+	info, err := os.Stat(outPath)
+	if err != nil {
+		_ = os.Remove(outPath)
+		return "", err
+	}
+	if info.Size() <= maxBytes {
+		return outPath, nil
+	}
+
+	duration, err := getAudioDurationSeconds(srcPath)
+	if err != nil {
+		_ = os.Remove(outPath)
+		return "", err
+	}
+	if duration <= 0 {
+		_ = os.Remove(outPath)
+		return "", fmt.Errorf("invalid duration for %s", filepath.Base(srcPath))
+	}
+
+	targetBitsPerSec := (float64(maxBytes) * 8.0 / duration) * 0.95
+	sampleRate, channels := chooseResamplePlan(targetBitsPerSec)
+	if err := runFlacCompress(srcPath, outPath, sampleRate, channels, true); err != nil {
+		_ = os.Remove(outPath)
+		return "", err
+	}
+
+	info, err = os.Stat(outPath)
+	if err != nil {
+		_ = os.Remove(outPath)
+		return "", err
+	}
+	if info.Size() > maxBytes {
+		return "", fmt.Errorf("cannot compress below %dMB", maxBytes/1024/1024)
+	}
+	return outPath, nil
+}
+
+func runFlacCompress(srcPath, outPath string, sampleRate int, channels int, force16 bool) error {
+	args := []string{"-y", "-i", srcPath, "-vn", "-c:a", "flac", "-compression_level", "12"}
+	if force16 {
+		args = append(args, "-sample_fmt", "s16")
+	}
+	if sampleRate > 0 {
+		args = append(args, "-ar", strconv.Itoa(sampleRate))
+	}
+	if channels > 0 {
+		args = append(args, "-ac", strconv.Itoa(channels))
+	}
+	args = append(args, outPath)
+	cmd := exec.Command(Config.FFmpegPath, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg compress failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func chooseResamplePlan(targetBitsPerSec float64) (int, int) {
+	channels := 2
+	targetRate := targetBitsPerSec / float64(16*channels)
+	if targetRate < 12000 {
+		channels = 1
+		targetRate = targetBitsPerSec / float64(16*channels)
+	}
+	return pickSampleRate(targetRate), channels
+}
+
+func pickSampleRate(target float64) int {
+	rates := []int{48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000}
+	for _, rate := range rates {
+		if float64(rate) <= target {
+			return rate
+		}
+	}
+	return rates[len(rates)-1]
+}
+
+func makeTempFlacPath(srcPath string) string {
+	base := strings.TrimSuffix(srcPath, filepath.Ext(srcPath))
+	outPath := base + ".tg.flac"
+	for i := 1; ; i++ {
+		if _, err := os.Stat(outPath); os.IsNotExist(err) {
+			return outPath
+		}
+		outPath = fmt.Sprintf("%s.tg%d.flac", base, i)
+	}
+}
+
+func getAudioDurationSeconds(path string) (float64, error) {
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+		out, err := cmd.Output()
+		if err == nil {
+			value := strings.TrimSpace(string(out))
+			if value != "" {
+				if secs, err := strconv.ParseFloat(value, 64); err == nil && secs > 0 {
+					return secs, nil
+				}
+			}
+		}
+	}
+
+	cmd := exec.Command(Config.FFmpegPath, "-i", path)
+	out, _ := cmd.CombinedOutput()
+	re := regexp.MustCompile(`Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)`)
+	match := re.FindStringSubmatch(string(out))
+	if len(match) != 4 {
+		return 0, fmt.Errorf("failed to read duration from ffmpeg output")
+	}
+	hours, _ := strconv.ParseFloat(match[1], 64)
+	minutes, _ := strconv.ParseFloat(match[2], 64)
+	seconds, _ := strconv.ParseFloat(match[3], 64)
+	return hours*3600 + minutes*60 + seconds, nil
 }
 
 func (b *TelegramBot) sendMessage(chatID int64, text string, markup any) error {
