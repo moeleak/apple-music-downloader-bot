@@ -29,6 +29,24 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
+type ProgressFunc func(phase string, done, total int64)
+
+type progressWriter struct {
+	cb    ProgressFunc
+	phase string
+	total int64
+	done  int64
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n := len(b)
+	p.done += int64(n)
+	if p.cb != nil {
+		p.cb(p.phase, p.done, p.total)
+	}
+	return n, nil
+}
+
 type PlaybackLicense struct {
 	ErrorCode  int    `json:"errorCode"`
 	License    string `json:"license"`
@@ -225,35 +243,44 @@ func extractKidBase64(b string, mvmode bool) (string, string, string, error) {
 	}
 	return kidbase64, urlBuilder.String(), uriPrefix, nil
 }
-func extsong(b string) bytes.Buffer {
+func extsong(b string, progress ProgressFunc) bytes.Buffer {
 	resp, err := http.Get(b)
 	if err != nil {
 		fmt.Printf("下载文件失败: %v\n", err)
 	}
 	defer resp.Body.Close()
 	var buffer bytes.Buffer
-	bar := progressbar.NewOptions64(
-		resp.ContentLength,
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionSetElapsedTime(false),
-		progressbar.OptionSetPredictTime(false),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionShowCount(),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetDescription("Downloading..."),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "",
-			SaucerHead:    "",
-			SaucerPadding: "",
-			BarStart:      "",
-			BarEnd:        "",
-		}),
-	)
-	io.Copy(io.MultiWriter(&buffer, bar), resp.Body)
+	if progress != nil {
+		pw := &progressWriter{
+			cb:    progress,
+			phase: "Downloading",
+			total: resp.ContentLength,
+		}
+		io.Copy(io.MultiWriter(&buffer, pw), resp.Body)
+	} else {
+		bar := progressbar.NewOptions64(
+			resp.ContentLength,
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionSetElapsedTime(false),
+			progressbar.OptionSetPredictTime(false),
+			progressbar.OptionShowElapsedTimeOnFinish(),
+			progressbar.OptionShowCount(),
+			progressbar.OptionEnableColorCodes(true),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetDescription("Downloading..."),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "",
+				SaucerHead:    "",
+				SaucerPadding: "",
+				BarStart:      "",
+				BarEnd:        "",
+			}),
+		)
+		io.Copy(io.MultiWriter(&buffer, bar), resp.Body)
+	}
 	return buffer
 }
-func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string) (string, error) {
+func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string, progress ProgressFunc) (string, error) {
 	var keystr string //for mv key
 	var fileurl string
 	var kidBase64 string
@@ -310,17 +337,23 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 		keyAndUrls := "1:" + keystr + ";" + fileurl
 		return keyAndUrls, nil
 	}
-	body := extsong(fileurl)
+	body := extsong(fileurl, progress)
 	fmt.Print("Downloaded\n")
 	//bodyReader := bytes.NewReader(body)
 	var buffer bytes.Buffer
 
+	if progress != nil {
+		progress("Decrypting", 0, 0)
+	}
 	err = DecryptMP4(&body, keybt, &buffer)
 	if err != nil {
 		fmt.Print("Decryption failed\n")
 		return "", err
 	} else {
 		fmt.Print("Decrypted\n")
+	}
+	if progress != nil {
+		progress("Decrypting", 1, 1)
 	}
 	// create output file
 	ofh, err := os.Create(trackpath)

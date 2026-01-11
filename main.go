@@ -55,6 +55,7 @@ var (
 	counter        structs.Counter
 	okDict         = make(map[string][]int)
 	lastDownloadedPaths []string
+	activeProgress func(phase string, done, total int64)
 )
 
 func loadConfig() error {
@@ -659,17 +660,24 @@ func isLossySource(ext string, codec string) bool {
 }
 
 // CONVERSION FEATURE: Build ffmpeg arguments for desired target.
-func buildFFmpegArgs(ffmpegPath, inPath, outPath, targetFmt, extraArgs string) ([]string, error) {
+func buildFFmpegArgs(ffmpegPath, inPath, outPath, targetFmt, extraArgs string, coverPath string) ([]string, error) {
 	args := []string{"-y", "-i", inPath}
+	if coverPath != "" {
+		args = append(args, "-i", coverPath)
+	}
 	switch targetFmt {
 	case "flac":
-		args = append(args,
-			"-map", "0:a",
-			"-map", "0:v?",
-			"-c:a", "flac",
-			"-c:v", "copy",
-			"-disposition:v", "attached_pic",
-		)
+		if coverPath != "" {
+			args = append(args,
+				"-map", "0:a",
+				"-map", "1:v",
+				"-c:a", "flac",
+				"-c:v", "mjpeg",
+				"-disposition:v", "attached_pic",
+			)
+		} else {
+			args = append(args, "-map", "0:a", "-c:a", "flac")
+		}
 	case "mp3":
 		args = append(args, "-vn")
 		// VBR quality 2 ~ high quality
@@ -743,7 +751,14 @@ func convertIfNeeded(track *task.Track) {
 		return
 	}
 
-	args, err := buildFFmpegArgs(Config.FFmpegPath, srcPath, outPath, targetFmt, Config.ConvertExtraArgs)
+	if activeProgress != nil {
+		activeProgress("Converting", 0, 0)
+	}
+	coverPath := ""
+	if targetFmt == "flac" && track.SaveDir != "" {
+		coverPath = findCoverFile(track.SaveDir)
+	}
+	args, err := buildFFmpegArgs(Config.FFmpegPath, srcPath, outPath, targetFmt, Config.ConvertExtraArgs, coverPath)
 	if err != nil {
 		fmt.Println("Conversion config error:", err)
 		return
@@ -964,7 +979,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			counter.Error++
 			return
 		}
-		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "")
+		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "", activeProgress)
 		if err != nil {
 			fmt.Println("Failed to dl aac-lc:", err)
 			if err.Error() == "Unavailable" {
@@ -982,7 +997,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			return
 		}
 		//边下载边解密
-		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config)
+		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config, activeProgress)
 		if err != nil {
 			fmt.Println("Failed to run v2:", err)
 			counter.Error++
@@ -1161,7 +1176,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		keyAndUrls, _ := runv3.Run(station.ID, trackM3U8, token, mediaUserToken, true, serverUrl)
+		keyAndUrls, _ := runv3.Run(station.ID, trackM3U8, token, mediaUserToken, true, serverUrl, nil)
 		err = runv3.ExtMvData(keyAndUrls, trackPath)
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
@@ -2055,11 +2070,11 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(mvm3u8url)
-	videokeyAndUrls, _ := runv3.Run(adamID, videom3u8url, token, mediaUserToken, true, "")
+	videokeyAndUrls, _ := runv3.Run(adamID, videom3u8url, token, mediaUserToken, true, "", nil)
 	_ = runv3.ExtMvData(videokeyAndUrls, vidPath)
 	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	audiokeyAndUrls, _ := runv3.Run(adamID, audiom3u8url, token, mediaUserToken, true, "")
+	audiokeyAndUrls, _ := runv3.Run(adamID, audiom3u8url, token, mediaUserToken, true, "", nil)
 	_ = runv3.ExtMvData(audiokeyAndUrls, audPath)
 	defer os.Remove(audPath)
 
@@ -2584,9 +2599,13 @@ type TelegramBot struct {
 
 type PendingSelection struct {
 	Kind             string
+	Query            string
+	Offset           int
+	HasNext          bool
 	Items            []SearchResultItem
 	CreatedAt        time.Time
 	ReplyToMessageID int
+	ResultsMessageID int
 }
 
 type Update struct {
@@ -2651,6 +2670,12 @@ type getUpdatesResponse struct {
 type apiResponse struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description,omitempty"`
+}
+
+type sendMessageResponse struct {
+	OK          bool    `json:"ok"`
+	Result      Message `json:"result"`
+	Description string  `json:"description,omitempty"`
 }
 
 func runTelegramBot(appleToken string) {
@@ -2746,6 +2771,11 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		if n, err := strconv.Atoi(numStr); err == nil {
 			b.handleSelection(cb.Message.Chat.ID, n)
 		}
+	} else if strings.HasPrefix(data, "page:") {
+		deltaStr := strings.TrimPrefix(data, "page:")
+		if delta, err := strconv.Atoi(deltaStr); err == nil {
+			b.handlePage(cb.Message.Chat.ID, cb.Message.MessageID, delta)
+		}
 	}
 	_ = b.answerCallbackQuery(cb.ID)
 }
@@ -2812,28 +2842,41 @@ func (b *TelegramBot) handleSearch(chatID int64, kind string, query string, repl
 		_ = b.sendMessageWithReply(chatID, "Search type must be song, album, or artist.", nil, replyToID)
 		return
 	}
-	apiType := kind + "s"
-	resp, err := ampapi.Search(Config.Storefront, query, apiType, Config.Language, b.appleToken, b.searchLimit, 0)
+	offset := 0
+	items, hasNext, err := b.fetchSearchPage(kind, query, offset)
 	if err != nil {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Search failed: %v", err), nil, replyToID)
 		return
 	}
-	items := buildSearchItems(kind, resp)
 	if len(items) == 0 {
 		_ = b.sendMessageWithReply(chatID, "No results found.", nil, replyToID)
 		return
 	}
-	b.setPending(chatID, kind, items, replyToID)
 	message := formatSearchResults(kind, query, items)
-	_ = b.sendMessageWithReply(chatID, message, buildInlineKeyboard(len(items)), replyToID)
+	messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(items), offset > 0, hasNext), replyToID)
+	if err != nil {
+		return
+	}
+	b.setPending(chatID, kind, query, offset, items, hasNext, replyToID, messageID)
 }
 
-func buildSearchItems(kind string, resp *ampapi.SearchResp) []SearchResultItem {
+func (b *TelegramBot) fetchSearchPage(kind string, query string, offset int) ([]SearchResultItem, bool, error) {
+	apiType := kind + "s"
+	resp, err := ampapi.Search(Config.Storefront, query, apiType, Config.Language, b.appleToken, b.searchLimit, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	items, hasNext := buildSearchItems(kind, resp)
+	return items, hasNext, nil
+}
+
+func buildSearchItems(kind string, resp *ampapi.SearchResp) ([]SearchResultItem, bool) {
 	items := []SearchResultItem{}
+	hasNext := false
 	switch kind {
 	case "song":
 		if resp.Results.Songs == nil {
-			return items
+			return items, false
 		}
 		for _, item := range resp.Results.Songs.Data {
 			detail := fmt.Sprintf("%s / %s", item.Attributes.ArtistName, item.Attributes.AlbumName)
@@ -2845,9 +2888,10 @@ func buildSearchItems(kind string, resp *ampapi.SearchResp) []SearchResultItem {
 				ID:     item.ID,
 			})
 		}
+		hasNext = resp.Results.Songs.Next != ""
 	case "album":
 		if resp.Results.Albums == nil {
-			return items
+			return items, false
 		}
 		for _, item := range resp.Results.Albums.Data {
 			year := ""
@@ -2863,9 +2907,10 @@ func buildSearchItems(kind string, resp *ampapi.SearchResp) []SearchResultItem {
 				ID:     item.ID,
 			})
 		}
+		hasNext = resp.Results.Albums.Next != ""
 	case "artist":
 		if resp.Results.Artists == nil {
-			return items
+			return items, false
 		}
 		for _, item := range resp.Results.Artists.Data {
 			detail := strings.Join(item.Attributes.GenreNames, ", ")
@@ -2877,8 +2922,9 @@ func buildSearchItems(kind string, resp *ampapi.SearchResp) []SearchResultItem {
 				ID:     item.ID,
 			})
 		}
+		hasNext = resp.Results.Artists.Next != ""
 	}
-	return items
+	return items, hasNext
 }
 
 func (b *TelegramBot) handleSelection(chatID int64, choice int) {
@@ -2901,11 +2947,9 @@ func (b *TelegramBot) handleSelection(chatID int64, choice int) {
 	switch pending.Kind {
 	case "song":
 		b.clearPending(chatID)
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Downloading: %s", selected.Name), nil, replyToID)
 		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID)
 	case "album":
 		b.clearPending(chatID)
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Downloading album: %s", selected.Name), nil, replyToID)
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
 		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit)
@@ -2917,12 +2961,43 @@ func (b *TelegramBot) handleSelection(chatID int64, choice int) {
 			_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
 			return
 		}
-		b.setPending(chatID, "album", albums, replyToID)
 		message := formatArtistAlbums(selected.Name, albums)
-		_ = b.sendMessageWithReply(chatID, message, buildInlineKeyboard(len(albums)), replyToID)
+		messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(albums), false, false), replyToID)
+		if err != nil {
+			return
+		}
+		b.setPending(chatID, "album", "", 0, albums, false, replyToID, messageID)
 	default:
 		b.clearPending(chatID)
 	}
+}
+
+func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
+	pending, ok := b.getPending(chatID)
+	if !ok {
+		return
+	}
+	if pending.ResultsMessageID != messageID {
+		return
+	}
+	if pending.Query == "" {
+		return
+	}
+	newOffset := pending.Offset + delta*b.searchLimit
+	if newOffset < 0 {
+		return
+	}
+	items, hasNext, err := b.fetchSearchPage(pending.Kind, pending.Query, newOffset)
+	if err != nil {
+		_ = b.editMessageText(chatID, messageID, fmt.Sprintf("Search failed: %v", err), nil)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	message := formatSearchResults(pending.Kind, pending.Query, items)
+	_ = b.editMessageText(chatID, messageID, message, buildInlineKeyboard(len(items), newOffset > 0, hasNext))
+	b.setPending(chatID, pending.Kind, pending.Query, newOffset, items, hasNext, pending.ReplyToMessageID, messageID)
 }
 
 func fetchArtistAlbums(storefront, artistID, token string, limit int) ([]SearchResultItem, error) {
@@ -3042,9 +3117,23 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 		return
 	}
 
-	err := fn()
+	status, err := newDownloadStatus(b, chatID, replyToID)
 	if err != nil {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Download failed: %v", err), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to create status message: %v", err), nil, replyToID)
+		dl_song = false
+		return
+	}
+
+	progress := func(phase string, done, total int64) {
+		status.Update(phase, done, total)
+	}
+	activeProgress = progress
+	defer func() { activeProgress = nil }()
+
+	status.Update("Downloading", 0, 0)
+	err = fn()
+	if err != nil {
+		status.Update(fmt.Sprintf("Failed: %v", err), 0, 0)
 		dl_song = false
 		return
 	}
@@ -3052,23 +3141,34 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 
 	paths := append([]string{}, lastDownloadedPaths...)
 	if len(paths) == 0 {
-		_ = b.sendMessageWithReply(chatID, "No files were downloaded.", nil, replyToID)
+		status.Update("No files were downloaded.", 0, 0)
 		return
 	}
+	sentAny := false
 	for _, path := range paths {
-		if err := b.sendAudioFile(chatID, path, replyToID); err != nil {
-			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to send audio: %v", err), nil, replyToID)
+		if err := b.sendAudioFile(chatID, path, replyToID, status); err != nil {
+			status.Update(fmt.Sprintf("Failed to send audio: %v", err), 0, 0)
+			continue
 		}
+		sentAny = true
+	}
+	if sentAny {
+		_ = b.deleteMessage(chatID, status.messageID)
 	}
 }
 
-func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int) error {
+func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int, status *DownloadStatus) error {
 	if strings.ToLower(filepath.Ext(filePath)) != ".flac" {
 		return fmt.Errorf("output is not FLAC: %s", filepath.Base(filePath))
 	}
 	sendPath := filePath
 	displayName := filepath.Base(filePath)
-	cleanup := func() {}
+	thumbPath := ""
+	cleanup := func() {
+		if thumbPath != "" {
+			_ = os.Remove(thumbPath)
+		}
+	}
 	defer cleanup()
 
 	info, err := os.Stat(sendPath)
@@ -3076,7 +3176,9 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		return err
 	}
 	if info.Size() > b.maxFileBytes {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("File exceeds %dMB, compressing...", b.maxFileBytes/1024/1024), nil, replyToID)
+		if status != nil {
+			status.Update("Compressing", 0, 0)
+		}
 		compressedPath, err := b.compressFlacToSize(sendPath, b.maxFileBytes)
 		if err != nil {
 			return err
@@ -3099,6 +3201,16 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	}
 	defer file.Close()
 
+	if status != nil {
+		status.Update("Uploading", 0, 0)
+	}
+	coverPath := findCoverFile(filepath.Dir(filePath))
+	if coverPath != "" {
+		if path, err := makeTelegramThumb(coverPath); err == nil {
+			thumbPath = path
+		}
+	}
+
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
@@ -3115,6 +3227,18 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	}
 	if _, err := io.Copy(part, file); err != nil {
 		return err
+	}
+	if thumbPath != "" {
+		thumbFile, err := os.Open(thumbPath)
+		if err == nil {
+			defer thumbFile.Close()
+			thumbPart, err := writer.CreateFormFile("thumbnail", filepath.Base(thumbPath))
+			if err == nil {
+				if _, err := io.Copy(thumbPart, thumbFile); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if err := writer.Close(); err != nil {
 		return err
@@ -3143,12 +3267,149 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	return nil
 }
 
+type DownloadStatus struct {
+	bot         *TelegramBot
+	chatID      int64
+	messageID   int
+	lastPhase   string
+	lastPercent int
+	lastText    string
+	lastUpdate  time.Time
+	mu          sync.Mutex
+}
+
+func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int) (*DownloadStatus, error) {
+	messageID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
+	if err != nil {
+		return nil, err
+	}
+	return &DownloadStatus{
+		bot:       bot,
+		chatID:    chatID,
+		messageID: messageID,
+	}, nil
+}
+
+func (s *DownloadStatus) Update(phase string, done, total int64) {
+	if s == nil || s.bot == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	normalizedPhase := strings.TrimSpace(phase)
+	if normalizedPhase == "" {
+		normalizedPhase = "Working"
+	}
+
+	percent := -1
+	if total > 0 {
+		percent = int(float64(done) / float64(total) * 100)
+		if percent < 0 {
+			percent = 0
+		}
+		if percent > 100 {
+			percent = 100
+		}
+	}
+
+	text := formatProgressText(normalizedPhase, done, total, percent)
+	now := time.Now()
+	phaseChanged := normalizedPhase != s.lastPhase
+	percentChanged := percent != s.lastPercent && percent >= 0
+	if text == s.lastText {
+		return
+	}
+	if !phaseChanged && !percentChanged && now.Sub(s.lastUpdate) < 2*time.Second {
+		return
+	}
+
+	_ = s.bot.editMessageText(s.chatID, s.messageID, text, nil)
+	s.lastPhase = normalizedPhase
+	s.lastPercent = percent
+	s.lastText = text
+	s.lastUpdate = now
+}
+
+func formatProgressText(phase string, done, total int64, percent int) string {
+	if total > 0 {
+		if percent < 0 {
+			percent = 0
+		}
+		return fmt.Sprintf("%s: %s / %s (%d%%)", phase, formatBytes(done), formatBytes(total), percent)
+	}
+	if done > 0 {
+		return fmt.Sprintf("%s: %s", phase, formatBytes(done))
+	}
+	return phase
+}
+
+func formatBytes(value int64) string {
+	if value < 1024 {
+		return fmt.Sprintf("%dB", value)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	size := float64(value)
+	unitIndex := 0
+	for size >= 1024 && unitIndex < len(units)-1 {
+		size /= 1024
+		unitIndex++
+	}
+	return fmt.Sprintf("%.1f%s", size, units[unitIndex])
+}
+
+func findCoverFile(dir string) string {
+	candidates := []string{
+		"cover.jpg",
+		"cover.png",
+		"folder.jpg",
+		"folder.png",
+	}
+	for _, name := range candidates {
+		path := filepath.Join(dir, name)
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+func makeTelegramThumb(coverPath string) (string, error) {
+	tmp, err := os.CreateTemp("", "amdl-thumb-*.jpg")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	args := []string{
+		"-y", "-i", coverPath,
+		"-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+		"-frames:v", "1",
+		"-q:v", "5",
+		tmpPath,
+	}
+	cmd := exec.Command(Config.FFmpegPath, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("ffmpeg thumb failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if info, err := os.Stat(tmpPath); err == nil && info.Size() > 200*1024 {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("thumb too large")
+	}
+	return tmpPath, nil
+}
+
 func (b *TelegramBot) compressFlacToSize(srcPath string, maxBytes int64) (string, error) {
 	outPath, err := makeTempFlacPath()
 	if err != nil {
 		return "", err
 	}
-	if err := runFlacCompress(srcPath, outPath, 0, 0, false); err != nil {
+	coverPath := findCoverFile(filepath.Dir(srcPath))
+	if err := runFlacCompress(srcPath, outPath, 0, 0, false, coverPath); err != nil {
 		_ = os.Remove(outPath)
 		return "", err
 	}
@@ -3173,7 +3434,7 @@ func (b *TelegramBot) compressFlacToSize(srcPath string, maxBytes int64) (string
 
 	targetBitsPerSec := (float64(maxBytes) * 8.0 / duration) * 0.95
 	sampleRate, channels := chooseResamplePlan(targetBitsPerSec)
-	if err := runFlacCompress(srcPath, outPath, sampleRate, channels, true); err != nil {
+	if err := runFlacCompress(srcPath, outPath, sampleRate, channels, true, coverPath); err != nil {
 		_ = os.Remove(outPath)
 		return "", err
 	}
@@ -3189,15 +3450,23 @@ func (b *TelegramBot) compressFlacToSize(srcPath string, maxBytes int64) (string
 	return outPath, nil
 }
 
-func runFlacCompress(srcPath, outPath string, sampleRate int, channels int, force16 bool) error {
-	args := []string{"-y", "-i", srcPath,
-		"-map", "0:a",
-		"-map", "0:v?",
-		"-c:a", "flac",
-		"-c:v", "copy",
-		"-disposition:v", "attached_pic",
-		"-compression_level", "12",
+func runFlacCompress(srcPath, outPath string, sampleRate int, channels int, force16 bool, coverPath string) error {
+	args := []string{"-y", "-i", srcPath}
+	if coverPath != "" {
+		args = append(args, "-i", coverPath)
+		args = append(args,
+			"-map", "0:a",
+			"-map", "1:v",
+			"-c:v", "mjpeg",
+			"-disposition:v", "attached_pic",
+		)
+	} else {
+		args = append(args, "-map", "0:a", "-map", "0:v?")
 	}
+	args = append(args,
+		"-c:a", "flac",
+		"-compression_level", "12",
+	)
 	if force16 {
 		args = append(args, "-sample_fmt", "s16")
 	}
@@ -3280,6 +3549,11 @@ func (b *TelegramBot) sendMessage(chatID int64, text string, markup any) error {
 }
 
 func (b *TelegramBot) sendMessageWithReply(chatID int64, text string, markup any, replyToID int) error {
+	_, err := b.sendMessageWithReplyReturn(chatID, text, markup, replyToID)
+	return err
+}
+
+func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, markup any, replyToID int) (int, error) {
 	payload := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
@@ -3292,29 +3566,29 @@ func (b *TelegramBot) sendMessageWithReply(chatID int64, text string, markup any
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req, err := http.NewRequest("POST", b.apiURL("sendMessage"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram sendMessage failed: %s", resp.Status)
+		return 0, fmt.Errorf("telegram sendMessage failed: %s", resp.Status)
 	}
-	apiResp := apiResponse{}
+	apiResp := sendMessageResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return err
+		return 0, err
 	}
 	if !apiResp.OK {
-		return fmt.Errorf("telegram sendMessage error: %s", apiResp.Description)
+		return 0, fmt.Errorf("telegram sendMessage error: %s", apiResp.Description)
 	}
-	return nil
+	return apiResp.Result.MessageID, nil
 }
 
 func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
@@ -3329,6 +3603,60 @@ func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
 		return err
 	}
 	req, err := http.NewRequest("POST", b.apiURL("answerCallbackQuery"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (b *TelegramBot) editMessageText(chatID int64, messageID int, text string, markup any) error {
+	if messageID == 0 {
+		return nil
+	}
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("editMessageText"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (b *TelegramBot) deleteMessage(chatID int64, messageID int) error {
+	if messageID == 0 {
+		return nil
+	}
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("deleteMessage"), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -3381,14 +3709,18 @@ func (b *TelegramBot) isAllowedChat(chatID int64) bool {
 	return b.allowedChats[chatID]
 }
 
-func (b *TelegramBot) setPending(chatID int64, kind string, items []SearchResultItem, replyToID int) {
+func (b *TelegramBot) setPending(chatID int64, kind string, query string, offset int, items []SearchResultItem, hasNext bool, replyToID int, resultsMessageID int) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	b.pending[chatID] = &PendingSelection{
 		Kind:             kind,
+		Query:            query,
+		Offset:           offset,
+		HasNext:          hasNext,
 		Items:            items,
 		CreatedAt:        time.Now(),
 		ReplyToMessageID: replyToID,
+		ResultsMessageID: resultsMessageID,
 	}
 }
 
@@ -3462,7 +3794,7 @@ func formatArtistAlbums(artistName string, items []SearchResultItem) string {
 	return strings.TrimSpace(b.String())
 }
 
-func buildInlineKeyboard(count int) InlineKeyboardMarkup {
+func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMarkup {
 	rowSize := 4
 	rows := [][]InlineKeyboardButton{}
 	row := []InlineKeyboardButton{}
@@ -3478,6 +3810,22 @@ func buildInlineKeyboard(count int) InlineKeyboardMarkup {
 	}
 	if len(row) > 0 {
 		rows = append(rows, row)
+	}
+	navRow := []InlineKeyboardButton{}
+	if hasPrev {
+		navRow = append(navRow, InlineKeyboardButton{
+			Text:         "Prev",
+			CallbackData: "page:-1",
+		})
+	}
+	if hasNext {
+		navRow = append(navRow, InlineKeyboardButton{
+			Text:         "Next",
+			CallbackData: "page:1",
+		})
+	}
+	if len(navRow) > 0 {
+		rows = append(rows, navRow)
 	}
 	return InlineKeyboardMarkup{
 		InlineKeyboard: rows,

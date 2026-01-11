@@ -31,6 +31,24 @@ type TimedResponseBody struct {
 	body      io.Reader
 }
 
+type ProgressFunc func(phase string, done, total int64)
+
+type progressWriter struct {
+	cb    ProgressFunc
+	phase string
+	total int64
+	done  int64
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n := len(b)
+	p.done += int64(n)
+	if p.cb != nil {
+		p.cb(p.phase, p.done, p.total)
+	}
+	return n, nil
+}
+
 func (b *TimedResponseBody) Read(p []byte) (int, error) {
 	n, err := b.body.Read(p)
 	if err != nil {
@@ -44,7 +62,7 @@ func (b *TimedResponseBody) Read(p []byte) (int, error) {
 }
 
 
-func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
+func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet, progress ProgressFunc) error {
 	var err error
 	var optstimeout uint
 	optstimeout = 0
@@ -120,27 +138,36 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		defer do.Body.Close()
 		if do.ContentLength < int64(Config.MaxMemoryLimit * 1024 * 1024) {
 			var buffer bytes.Buffer
-			bar := progressbar.NewOptions64(
-				do.ContentLength,
-				progressbar.OptionClearOnFinish(),
-				progressbar.OptionSetElapsedTime(false),
-				progressbar.OptionSetPredictTime(false),
-				progressbar.OptionShowElapsedTimeOnFinish(),
-				progressbar.OptionShowCount(),
-				progressbar.OptionEnableColorCodes(true),
-				progressbar.OptionShowBytes(true),
-				progressbar.OptionSetDescription("Downloading..."),
-				progressbar.OptionSetTheme(progressbar.Theme{
-					Saucer:        "",
-					SaucerHead:    "",
-					SaucerPadding: "",
-					BarStart:      "",
-					BarEnd:        "",
-				}),
-			)
-			io.Copy(io.MultiWriter(&buffer, bar), do.Body)
+			if progress != nil {
+				pw := &progressWriter{
+					cb:    progress,
+					phase: "Downloading",
+					total: do.ContentLength,
+				}
+				io.Copy(io.MultiWriter(&buffer, pw), do.Body)
+			} else {
+				bar := progressbar.NewOptions64(
+					do.ContentLength,
+					progressbar.OptionClearOnFinish(),
+					progressbar.OptionSetElapsedTime(false),
+					progressbar.OptionSetPredictTime(false),
+					progressbar.OptionShowElapsedTimeOnFinish(),
+					progressbar.OptionShowCount(),
+					progressbar.OptionEnableColorCodes(true),
+					progressbar.OptionShowBytes(true),
+					progressbar.OptionSetDescription("Downloading..."),
+					progressbar.OptionSetTheme(progressbar.Theme{
+						Saucer:        "",
+						SaucerHead:    "",
+						SaucerPadding: "",
+						BarStart:      "",
+						BarEnd:        "",
+					}),
+				)
+				io.Copy(io.MultiWriter(&buffer, bar), do.Body)
+				fmt.Print("Downloaded\n")
+			}
 			body = &buffer
-			fmt.Print("Downloaded\n")
 		} else {
 			body = do.Body
 		}
@@ -158,7 +185,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	//fmt.Print("Decrypting...\n")
 	defer Close(conn)
 
-	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config)
+	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config, progress)
 	if err != nil {
 		return err
 	}
@@ -167,7 +194,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 }
 
 func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
-	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet) error {
+	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet, progress ProgressFunc) error {
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
@@ -206,24 +233,29 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 
 	// 'segment' in m3u8 == 'fragment' in mp4ff
 	//fmt.Println("Starting decryption...")
-	bar := progressbar.NewOptions64(totalLen,
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionSetElapsedTime(false),
-		progressbar.OptionSetPredictTime(false),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionShowCount(),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetDescription("Decrypting..."),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "",
-			SaucerHead:    "",
-			SaucerPadding: "",
-			BarStart:      "",
-			BarEnd:        "",
-		}),
-	)
-	bar.Add64(int64(offset))
+	var bar *progressbar.ProgressBar
+	if progress == nil {
+		bar = progressbar.NewOptions64(totalLen,
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionSetElapsedTime(false),
+			progressbar.OptionSetPredictTime(false),
+			progressbar.OptionShowElapsedTimeOnFinish(),
+			progressbar.OptionShowCount(),
+			progressbar.OptionEnableColorCodes(true),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetDescription("Decrypting..."),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "",
+				SaucerHead:    "",
+				SaucerPadding: "",
+				BarStart:      "",
+				BarEnd:        "",
+			}),
+		)
+		bar.Add64(int64(offset))
+	} else {
+		progress("Downloading", int64(offset), totalLen)
+	}
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	for i := 0; ; i++ {
 		var frag *mp4.Fragment
@@ -267,7 +299,11 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 		if err != nil {
 			return err
 		}
-		bar.Add64(int64(rawoffset))
+		if progress != nil {
+			progress("Downloading", int64(offset), totalLen)
+		} else {
+			bar.Add64(int64(rawoffset))
+		}
 	}
 	err = outBuf.Flush()
 	if err != nil {
