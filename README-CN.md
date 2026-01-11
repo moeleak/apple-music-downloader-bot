@@ -37,6 +37,20 @@
 
 [中文教程-详见方法三](https://telegra.ph/Apple-Music-Alac高解析度无损音乐下载教程-04-02-2)
 
+## Telegram 机器人模式
+1. 在 `config.yaml` 设置 `telegram-bot-token`（或导出 `TELEGRAM_BOT_TOKEN`）。
+2. 可选：设置 `telegram-allowed-chat-ids` 限制使用者。
+3. 启动：`go run main.go --bot`
+4. 命令示例：
+   - `/search_song <关键词>`
+   - `/search_album <关键词>`
+   - `/search_artist <关键词>`
+   - `/id <song|album> <id>`
+
+注意：
+- 机器人会发送 FLAC，需要系统有 `ffmpeg`。
+- 大文件可能超过 Telegram 限制，可调整 `telegram-max-file-mb`。
+
 ## 下载歌词
 
 1. 打开 [Apple Music](https://music.apple.com) 并登录

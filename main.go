@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"main/utils/ampapi"
@@ -52,6 +54,7 @@ var (
 	Config         structs.ConfigSet
 	counter        structs.Counter
 	okDict         = make(map[string][]int)
+	lastDownloadedPaths []string
 )
 
 func loadConfig() error {
@@ -67,6 +70,13 @@ func loadConfig() error {
 		Config.Storefront = "us"
 	}
 	return nil
+}
+
+func recordDownloadedPath(path string) {
+	if path == "" {
+		return
+	}
+	lastDownloadedPaths = append(lastDownloadedPaths, path)
 }
 
 func LimitString(s string) string {
@@ -869,13 +879,15 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 
 	// Determine possible post-conversion target file (so we can skip re-download)
 	var convertedPath string
-	considerConverted := false
-	if Config.ConvertAfterDownload &&
+	conversionEnabled := Config.ConvertAfterDownload &&
 		Config.ConvertFormat != "" &&
-		strings.ToLower(Config.ConvertFormat) != "copy" &&
-		!Config.ConvertKeepOriginal {
+		strings.ToLower(Config.ConvertFormat) != "copy"
+	considerConverted := false
+	if conversionEnabled {
 		convertedPath = strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + "." + strings.ToLower(Config.ConvertFormat)
-		considerConverted = true
+		if !Config.ConvertKeepOriginal {
+			considerConverted = true
+		}
 	}
 	//get lrc
 	var lrc string = ""
@@ -903,6 +915,22 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 	if existsOriginal {
 		fmt.Println("Track already exists locally.")
+		track.SavePath = trackPath
+		track.SaveName = filepath.Base(trackPath)
+		if conversionEnabled {
+			if considerConverted {
+				existsConverted, err2 := fileExists(convertedPath)
+				if err2 == nil && existsConverted {
+					track.SavePath = convertedPath
+					track.SaveName = filepath.Base(convertedPath)
+				} else {
+					convertIfNeeded(track)
+				}
+			} else {
+				convertIfNeeded(track)
+			}
+		}
+		recordDownloadedPath(track.SavePath)
 		counter.Success++
 		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 		return
@@ -911,6 +939,9 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		existsConverted, err2 := fileExists(convertedPath)
 		if err2 == nil && existsConverted {
 			fmt.Println("Converted track already exists locally.")
+			track.SavePath = convertedPath
+			track.SaveName = filepath.Base(convertedPath)
+			recordDownloadedPath(track.SavePath)
 			counter.Success++
 			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 			return
@@ -987,6 +1018,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	// CONVERSION FEATURE hook
 	convertIfNeeded(track)
 
+	recordDownloadedPath(track.SavePath)
 	counter.Success++
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
@@ -1794,7 +1826,9 @@ func main() {
 		}
 	}
 	var search_type string
+	var bot_mode bool
 	pflag.StringVar(&search_type, "search", "", "Search for 'album', 'song', or 'artist'. Provide query after flags.")
+	pflag.BoolVar(&bot_mode, "bot", false, "Run Telegram bot mode")
 	pflag.BoolVar(&dl_atmos, "atmos", false, "Enable atmos download mode")
 	pflag.BoolVar(&dl_aac, "aac", false, "Enable adm-aac download mode")
 	pflag.BoolVar(&dl_select, "select", false, "Enable selective download")
@@ -1820,6 +1854,11 @@ func main() {
 	Config.AacType = *aac_type
 	Config.MVAudioType = *mv_audio_type
 	Config.MVMax = *mv_max
+
+	if bot_mode {
+		runTelegramBot(token)
+		return
+	}
 
 	args := pflag.Args()
 
@@ -2510,4 +2549,711 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 	}
 
 	return nil
+}
+
+
+
+const (
+	defaultSearchLimit = 8
+	pendingTTL         = 10 * time.Minute
+)
+
+type TelegramBot struct {
+	token        string
+	appleToken   string
+	client       *http.Client
+	allowedChats map[int64]bool
+	searchLimit  int
+	maxFileBytes int64
+
+	pendingMu sync.Mutex
+	pending   map[int64]*PendingSelection
+
+	downloadSem chan struct{}
+}
+
+type PendingSelection struct {
+	Kind      string
+	Items     []SearchResultItem
+	CreatedAt time.Time
+}
+
+type Update struct {
+	UpdateID int      `json:"update_id"`
+	Message  *Message `json:"message,omitempty"`
+}
+
+type Message struct {
+	MessageID int    `json:"message_id"`
+	From      *User  `json:"from,omitempty"`
+	Chat      Chat   `json:"chat"`
+	Text      string `json:"text,omitempty"`
+}
+
+type User struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username,omitempty"`
+}
+
+type Chat struct {
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
+}
+
+type ReplyKeyboardMarkup struct {
+	Keyboard        [][]KeyboardButton `json:"keyboard"`
+	ResizeKeyboard  bool               `json:"resize_keyboard,omitempty"`
+	OneTimeKeyboard bool               `json:"one_time_keyboard,omitempty"`
+}
+
+type ReplyKeyboardRemove struct {
+	RemoveKeyboard bool `json:"remove_keyboard"`
+}
+
+type KeyboardButton struct {
+	Text string `json:"text"`
+}
+
+type getUpdatesResponse struct {
+	OK          bool     `json:"ok"`
+	Result      []Update `json:"result"`
+	Description string   `json:"description,omitempty"`
+}
+
+type apiResponse struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description,omitempty"`
+}
+
+func runTelegramBot(appleToken string) {
+	botToken := strings.TrimSpace(Config.TelegramBotToken)
+	if botToken == "" {
+		botToken = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	}
+	if botToken == "" {
+		fmt.Println("telegram-bot-token is not set. Add it to config.yaml or TELEGRAM_BOT_TOKEN.")
+		return
+	}
+	if Config.TelegramDownloadFolder != "" {
+		Config.AlacSaveFolder = Config.TelegramDownloadFolder
+	}
+
+	bot := newTelegramBot(botToken, appleToken)
+	fmt.Println("Telegram bot started. Waiting for updates...")
+	bot.loop()
+}
+
+func newTelegramBot(token, appleToken string) *TelegramBot {
+	allowed := make(map[int64]bool)
+	for _, id := range Config.TelegramAllowedChatIDs {
+		allowed[id] = true
+	}
+	searchLimit := Config.TelegramSearchLimit
+	if searchLimit <= 0 {
+		searchLimit = defaultSearchLimit
+	}
+	maxFileBytes := int64(Config.TelegramMaxFileMB) * 1024 * 1024
+	if maxFileBytes <= 0 {
+		maxFileBytes = 49 * 1024 * 1024
+	}
+	return &TelegramBot{
+		token:        token,
+		appleToken:   appleToken,
+		client:       &http.Client{Timeout: 60 * time.Second},
+		allowedChats: allowed,
+		searchLimit:  searchLimit,
+		maxFileBytes: maxFileBytes,
+		pending:      make(map[int64]*PendingSelection),
+		downloadSem:  make(chan struct{}, 1),
+	}
+}
+
+func (b *TelegramBot) loop() {
+	offset := 0
+	for {
+		updates, err := b.getUpdates(offset)
+		if err != nil {
+			fmt.Println("getUpdates error:", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		for _, upd := range updates {
+			if upd.UpdateID >= offset {
+				offset = upd.UpdateID + 1
+			}
+			if upd.Message != nil {
+				b.handleMessage(upd.Message)
+			}
+		}
+	}
+}
+
+func (b *TelegramBot) handleMessage(msg *Message) {
+	if msg.Text == "" {
+		return
+	}
+	if !b.isAllowedChat(msg.Chat.ID) {
+		_ = b.sendMessage(msg.Chat.ID, "Not authorized for this bot.", nil)
+		return
+	}
+	text := strings.TrimSpace(msg.Text)
+	if cmd, args, ok := parseCommand(text); ok {
+		b.handleCommand(msg.Chat.ID, cmd, args)
+		return
+	}
+	if n, err := strconv.Atoi(text); err == nil {
+		b.handleSelection(msg.Chat.ID, n)
+		return
+	}
+}
+
+func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string) {
+	switch cmd {
+	case "start", "help":
+		_ = b.sendMessage(chatID, botHelpText(), nil)
+	case "search_song":
+		b.handleSearch(chatID, "song", strings.Join(args, " "))
+	case "search_album":
+		b.handleSearch(chatID, "album", strings.Join(args, " "))
+	case "search_artist":
+		b.handleSearch(chatID, "artist", strings.Join(args, " "))
+	case "search":
+		if len(args) < 2 {
+			_ = b.sendMessage(chatID, "Usage: /search <song|album|artist> <keywords>", nil)
+			return
+		}
+		kind := strings.ToLower(args[0])
+		b.handleSearch(chatID, kind, strings.Join(args[1:], " "))
+	case "id":
+		if len(args) == 0 {
+			_ = b.sendMessage(chatID, "Usage: /id <song|album> <id>", nil)
+			return
+		}
+		if len(args) == 1 {
+			b.queueDownloadSong(chatID, args[0])
+			return
+		}
+		switch strings.ToLower(args[0]) {
+		case "song":
+			b.queueDownloadSong(chatID, args[1])
+		case "album":
+			b.queueDownloadAlbum(chatID, args[1])
+		default:
+			_ = b.sendMessage(chatID, "Usage: /id <song|album> <id>", nil)
+		}
+	case "songid":
+		if len(args) == 0 {
+			_ = b.sendMessage(chatID, "Usage: /songid <id>", nil)
+			return
+		}
+		b.queueDownloadSong(chatID, args[0])
+	case "albumid":
+		if len(args) == 0 {
+			_ = b.sendMessage(chatID, "Usage: /albumid <id>", nil)
+			return
+		}
+		b.queueDownloadAlbum(chatID, args[0])
+	default:
+		_ = b.sendMessage(chatID, "Unknown command. Send /help for usage.", nil)
+	}
+}
+
+func (b *TelegramBot) handleSearch(chatID int64, kind string, query string) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		_ = b.sendMessage(chatID, "Please provide a search query.", nil)
+		return
+	}
+	kind = strings.ToLower(kind)
+	if kind != "song" && kind != "album" && kind != "artist" {
+		_ = b.sendMessage(chatID, "Search type must be song, album, or artist.", nil)
+		return
+	}
+	apiType := kind + "s"
+	resp, err := ampapi.Search(Config.Storefront, query, apiType, Config.Language, b.appleToken, b.searchLimit, 0)
+	if err != nil {
+		_ = b.sendMessage(chatID, fmt.Sprintf("Search failed: %v", err), nil)
+		return
+	}
+	items := buildSearchItems(kind, resp)
+	if len(items) == 0 {
+		_ = b.sendMessage(chatID, "No results found.", nil)
+		return
+	}
+	b.setPending(chatID, kind, items)
+	message := formatSearchResults(kind, query, items)
+	_ = b.sendMessage(chatID, message, buildNumberKeyboard(len(items)))
+}
+
+func buildSearchItems(kind string, resp *ampapi.SearchResp) []SearchResultItem {
+	items := []SearchResultItem{}
+	switch kind {
+	case "song":
+		if resp.Results.Songs == nil {
+			return items
+		}
+		for _, item := range resp.Results.Songs.Data {
+			detail := fmt.Sprintf("%s / %s", item.Attributes.ArtistName, item.Attributes.AlbumName)
+			items = append(items, SearchResultItem{
+				Type:   "Song",
+				Name:   item.Attributes.Name,
+				Detail: detail,
+				URL:    item.Attributes.URL,
+				ID:     item.ID,
+			})
+		}
+	case "album":
+		if resp.Results.Albums == nil {
+			return items
+		}
+		for _, item := range resp.Results.Albums.Data {
+			year := ""
+			if len(item.Attributes.ReleaseDate) >= 4 {
+				year = item.Attributes.ReleaseDate[:4]
+			}
+			detail := fmt.Sprintf("%s (%s, %d tracks)", item.Attributes.ArtistName, year, item.Attributes.TrackCount)
+			items = append(items, SearchResultItem{
+				Type:   "Album",
+				Name:   item.Attributes.Name,
+				Detail: detail,
+				URL:    item.Attributes.URL,
+				ID:     item.ID,
+			})
+		}
+	case "artist":
+		if resp.Results.Artists == nil {
+			return items
+		}
+		for _, item := range resp.Results.Artists.Data {
+			detail := strings.Join(item.Attributes.GenreNames, ", ")
+			items = append(items, SearchResultItem{
+				Type:   "Artist",
+				Name:   item.Attributes.Name,
+				Detail: detail,
+				URL:    item.Attributes.URL,
+				ID:     item.ID,
+			})
+		}
+	}
+	return items
+}
+
+func (b *TelegramBot) handleSelection(chatID int64, choice int) {
+	pending, ok := b.getPending(chatID)
+	if !ok {
+		_ = b.sendMessage(chatID, "No active selection. Start with /search_song or /search_album.", nil)
+		return
+	}
+	if time.Since(pending.CreatedAt) > pendingTTL {
+		b.clearPending(chatID)
+		_ = b.sendMessage(chatID, "Selection expired. Please search again.", nil)
+		return
+	}
+	if choice < 1 || choice > len(pending.Items) {
+		_ = b.sendMessage(chatID, "Selection out of range.", nil)
+		return
+	}
+	selected := pending.Items[choice-1]
+	switch pending.Kind {
+	case "song":
+		b.clearPending(chatID)
+		_ = b.sendMessage(chatID, fmt.Sprintf("Downloading: %s", selected.Name), removeKeyboard())
+		b.queueDownloadSong(chatID, selected.ID)
+	case "album":
+		b.clearPending(chatID)
+		_ = b.sendMessage(chatID, fmt.Sprintf("Downloading album: %s", selected.Name), removeKeyboard())
+		b.queueDownloadAlbum(chatID, selected.ID)
+	case "artist":
+		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit)
+		if err != nil {
+			_ = b.sendMessage(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil)
+			return
+		}
+		if len(albums) == 0 {
+			_ = b.sendMessage(chatID, "No albums found for this artist.", nil)
+			return
+		}
+		b.setPending(chatID, "album", albums)
+		message := formatArtistAlbums(selected.Name, albums)
+		_ = b.sendMessage(chatID, message, buildNumberKeyboard(len(albums)))
+	default:
+		b.clearPending(chatID)
+	}
+}
+
+func fetchArtistAlbums(storefront, artistID, token string, limit int) ([]SearchResultItem, error) {
+	offset := 0
+	items := []SearchResultItem{}
+	for {
+		req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s/albums", storefront, artistID), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+		req.Header.Set("Origin", "https://music.apple.com")
+		query := url.Values{}
+		query.Set("limit", "100")
+		query.Set("offset", strconv.Itoa(offset))
+		query.Set("l", Config.Language)
+		req.URL.RawQuery = query.Encode()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("artist albums request failed: %s", resp.Status)
+		}
+		obj := new(structs.AutoGeneratedArtist)
+		if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+		for _, album := range obj.Data {
+			items = append(items, SearchResultItem{
+				Type:   "Album",
+				Name:   album.Attributes.Name,
+				Detail: album.Attributes.ReleaseDate,
+				URL:    album.Attributes.URL,
+				ID:     album.ID,
+			})
+		}
+		if obj.Next == "" {
+			break
+		}
+		offset += 100
+	}
+	sort.Slice(items, func(i, j int) bool {
+		di, err1 := time.Parse("2006-01-02", items[i].Detail)
+		dj, err2 := time.Parse("2006-01-02", items[j].Detail)
+		if err1 != nil || err2 != nil {
+			return items[i].Name < items[j].Name
+		}
+		return di.After(dj)
+	})
+	if limit > 0 && len(items) > limit {
+		return items[:limit], nil
+	}
+	return items, nil
+}
+
+func (b *TelegramBot) queueDownloadSong(chatID int64, songID string) {
+	if songID == "" {
+		_ = b.sendMessage(chatID, "Song ID is empty.", nil)
+		return
+	}
+	go b.runDownload(chatID, func() error {
+		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken)
+	}, true)
+}
+
+func (b *TelegramBot) queueDownloadAlbum(chatID int64, albumID string) {
+	if albumID == "" {
+		_ = b.sendMessage(chatID, "Album ID is empty.", nil)
+		return
+	}
+	go b.runDownload(chatID, func() error {
+		return ripAlbum(albumID, b.appleToken, Config.Storefront, Config.MediaUserToken, "")
+	}, false)
+}
+
+func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool) {
+	if !b.tryAcquireDownload() {
+		_ = b.sendMessage(chatID, "Another download is in progress. Please try again shortly.", nil)
+		return
+	}
+	defer b.releaseDownload()
+
+	lastDownloadedPaths = nil
+	counter = structs.Counter{}
+	okDict = make(map[string][]int)
+
+	dl_atmos = false
+	dl_aac = false
+	dl_select = false
+	if single {
+		dl_song = true
+	} else {
+		dl_song = false
+	}
+
+	Config.ConvertAfterDownload = true
+	Config.ConvertFormat = "flac"
+	Config.ConvertKeepOriginal = false
+
+	if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
+		_ = b.sendMessage(chatID, fmt.Sprintf("ffmpeg not found at '%s'.", Config.FFmpegPath), nil)
+		dl_song = false
+		return
+	}
+
+	err := fn()
+	if err != nil {
+		_ = b.sendMessage(chatID, fmt.Sprintf("Download failed: %v", err), nil)
+		dl_song = false
+		return
+	}
+	dl_song = false
+
+	paths := append([]string{}, lastDownloadedPaths...)
+	if len(paths) == 0 {
+		_ = b.sendMessage(chatID, "No files were downloaded.", nil)
+		return
+	}
+	for _, path := range paths {
+		if err := b.sendAudioFile(chatID, path); err != nil {
+			_ = b.sendMessage(chatID, fmt.Sprintf("Failed to send audio: %v", err), nil)
+		}
+	}
+}
+
+func (b *TelegramBot) sendAudioFile(chatID int64, filePath string) error {
+	if strings.ToLower(filepath.Ext(filePath)) != ".flac" {
+		return fmt.Errorf("output is not FLAC: %s", filepath.Base(filePath))
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+	if info.Size() > b.maxFileBytes {
+		return fmt.Errorf("file too large for Telegram: %s", info.Name())
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+		return err
+	}
+	part, err := writer.CreateFormFile("audio", filepath.Base(filePath))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", b.apiURL("sendAudio"), &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram sendAudio failed: %s", resp.Status)
+	}
+	apiResp := apiResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return err
+	}
+	if !apiResp.OK {
+		return fmt.Errorf("telegram sendAudio error: %s", apiResp.Description)
+	}
+	return nil
+}
+
+func (b *TelegramBot) sendMessage(chatID int64, text string, markup any) error {
+	payload := map[string]any{
+		"chat_id": chatID,
+		"text":    text,
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("sendMessage"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram sendMessage failed: %s", resp.Status)
+	}
+	apiResp := apiResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return err
+	}
+	if !apiResp.OK {
+		return fmt.Errorf("telegram sendMessage error: %s", apiResp.Description)
+	}
+	return nil
+}
+
+func (b *TelegramBot) getUpdates(offset int) ([]Update, error) {
+	req, err := http.NewRequest("GET", b.apiURL("getUpdates"), nil)
+	if err != nil {
+		return nil, err
+	}
+	query := req.URL.Query()
+	query.Set("timeout", "30")
+	if offset > 0 {
+		query.Set("offset", strconv.Itoa(offset))
+	}
+	req.URL.RawQuery = query.Encode()
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("getUpdates failed: %s", resp.Status)
+	}
+	var data getUpdatesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+	if !data.OK {
+		return nil, fmt.Errorf("getUpdates error: %s", data.Description)
+	}
+	return data.Result, nil
+}
+
+func (b *TelegramBot) apiURL(method string) string {
+	return fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.token, method)
+}
+
+func (b *TelegramBot) isAllowedChat(chatID int64) bool {
+	if len(b.allowedChats) == 0 {
+		return true
+	}
+	return b.allowedChats[chatID]
+}
+
+func (b *TelegramBot) setPending(chatID int64, kind string, items []SearchResultItem) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	b.pending[chatID] = &PendingSelection{
+		Kind:      kind,
+		Items:     items,
+		CreatedAt: time.Now(),
+	}
+}
+
+func (b *TelegramBot) getPending(chatID int64) (*PendingSelection, bool) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	pending, ok := b.pending[chatID]
+	return pending, ok
+}
+
+func (b *TelegramBot) clearPending(chatID int64) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	delete(b.pending, chatID)
+}
+
+func (b *TelegramBot) tryAcquireDownload() bool {
+	select {
+	case b.downloadSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *TelegramBot) releaseDownload() {
+	select {
+	case <-b.downloadSem:
+	default:
+	}
+}
+
+func parseCommand(text string) (string, []string, bool) {
+	if !strings.HasPrefix(text, "/") {
+		return "", nil, false
+	}
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return "", nil, false
+	}
+	cmd := strings.TrimPrefix(parts[0], "/")
+	if idx := strings.Index(cmd, "@"); idx != -1 {
+		cmd = cmd[:idx]
+	}
+	return strings.ToLower(cmd), parts[1:], true
+}
+
+func formatSearchResults(kind, query string, items []SearchResultItem) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Search %s: %s\n", kind, query))
+	for i, item := range items {
+		if item.Detail != "" {
+			b.WriteString(fmt.Sprintf("%d. %s - %s\n", i+1, item.Name, item.Detail))
+		} else {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, item.Name))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func formatArtistAlbums(artistName string, items []SearchResultItem) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Albums by %s:\n", artistName))
+	for i, item := range items {
+		if item.Detail != "" {
+			b.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, item.Name, item.Detail))
+		} else {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, item.Name))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func buildNumberKeyboard(count int) ReplyKeyboardMarkup {
+	rowSize := 4
+	rows := [][]KeyboardButton{}
+	row := []KeyboardButton{}
+	for i := 1; i <= count; i++ {
+		row = append(row, KeyboardButton{Text: strconv.Itoa(i)})
+		if len(row) == rowSize {
+			rows = append(rows, row)
+			row = []KeyboardButton{}
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	return ReplyKeyboardMarkup{
+		Keyboard:        rows,
+		ResizeKeyboard:  true,
+		OneTimeKeyboard: true,
+	}
+}
+
+func removeKeyboard() ReplyKeyboardRemove {
+	return ReplyKeyboardRemove{RemoveKeyboard: true}
+}
+
+func botHelpText() string {
+	return strings.TrimSpace(`
+Commands:
+/search_song <keywords>   search for songs
+/search_album <keywords>  search for albums
+/search_artist <keywords> search for artists
+/search <type> <keywords> unified search (type: song|album|artist)
+/songid <id>              download a song by ID
+/albumid <id>             download an album by ID
+/id <song|album> <id>     download by ID
+`)
 }

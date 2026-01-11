@@ -77,6 +77,20 @@ docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config
 
 [Chinese tutorial - see Method 3 for details](https://telegra.ph/Apple-Music-Alac高解析度无损音乐下载教程-04-02-2)
 
+## Telegram bot mode
+1. Set `telegram-bot-token` in `config.yaml` (or export `TELEGRAM_BOT_TOKEN`).
+2. Optional: set `telegram-allowed-chat-ids` to restrict usage.
+3. Start the bot: `go run main.go --bot`
+4. Commands:
+   - `/search_song <keywords>`
+   - `/search_album <keywords>`
+   - `/search_artist <keywords>`
+   - `/id <song|album> <id>`
+
+Notes:
+- The bot sends FLAC, so `ffmpeg` must be available.
+- Large files may exceed Telegram limits; adjust `telegram-max-file-mb` as needed.
+
 ## Downloading lyrics
 
 1. Open [Apple Music](https://music.apple.com) and log in

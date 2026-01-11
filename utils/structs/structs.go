@@ -38,14 +38,19 @@ type ConfigSet struct {
 	DlAlbumcoverForPlaylist bool   `yaml:"dl-albumcover-for-playlist"`
 	MVAudioType             string `yaml:"mv-audio-type"`
 	MVMax                   int    `yaml:"mv-max"`
-	ConvertAfterDownload       bool   `yaml:"convert-after-download"`
-	ConvertFormat              string `yaml:"convert-format"`
-	ConvertKeepOriginal        bool   `yaml:"convert-keep-original"`
-	ConvertSkipIfSourceMatch   bool   `yaml:"convert-skip-if-source-matches"`
-	FFmpegPath                 string `yaml:"ffmpeg-path"`
-	ConvertExtraArgs           string `yaml:"convert-extra-args"`
-	ConvertWarnLossyToLossless bool   `yaml:"convert-warn-lossy-to-lossless"`
-	ConvertSkipLossyToLossless bool   `yaml:"convert-skip-lossy-to-lossless"`
+	ConvertAfterDownload       bool    `yaml:"convert-after-download"`
+	ConvertFormat              string  `yaml:"convert-format"`
+	ConvertKeepOriginal        bool    `yaml:"convert-keep-original"`
+	ConvertSkipIfSourceMatch   bool    `yaml:"convert-skip-if-source-matches"`
+	FFmpegPath                 string  `yaml:"ffmpeg-path"`
+	ConvertExtraArgs           string  `yaml:"convert-extra-args"`
+	ConvertWarnLossyToLossless bool    `yaml:"convert-warn-lossy-to-lossless"`
+	ConvertSkipLossyToLossless bool    `yaml:"convert-skip-lossy-to-lossless"`
+	TelegramBotToken           string  `yaml:"telegram-bot-token"`
+	TelegramAllowedChatIDs     []int64 `yaml:"telegram-allowed-chat-ids"`
+	TelegramSearchLimit        int     `yaml:"telegram-search-limit"`
+	TelegramMaxFileMB          int     `yaml:"telegram-max-file-mb"`
+	TelegramDownloadFolder     string  `yaml:"telegram-download-folder"`
 }
 
 type Counter struct {
