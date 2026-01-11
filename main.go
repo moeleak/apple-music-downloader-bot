@@ -3139,6 +3139,8 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 	}
 	dl_song = false
 
+	activeProgress = nil
+
 	paths := append([]string{}, lastDownloadedPaths...)
 	if len(paths) == 0 {
 		status.Update("No files were downloaded.", 0, 0)
@@ -3348,7 +3350,7 @@ func formatBytes(value int64) string {
 	if value < 1024 {
 		return fmt.Sprintf("%dB", value)
 	}
-	units := []string{"KB", "MB", "GB", "TB"}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
 	size := float64(value)
 	unitIndex := 0
 	for size >= 1024 && unitIndex < len(units)-1 {
