@@ -37,6 +37,26 @@
 
 [中文教程-详见方法三](https://telegra.ph/Apple-Music-Alac高解析度无损音乐下载教程-04-02-2)
 
+## Docker
+构建镜像：
+```
+docker build -t apple-music-dl .
+```
+
+运行机器人：
+```
+docker run --rm -it \
+  -v "$PWD/config.yaml":/app/config.yaml \
+  -v "$PWD/downloads":/downloads \
+  -v "$PWD/telegram-cache.json":/app/telegram-cache.json \
+  -e TELEGRAM_BOT_TOKEN=你的BotToken \
+  apple-music-dl --bot
+```
+
+注意：
+- 只有启用 `telegram-cache-file` 时才需要挂载 `telegram-cache.json`。
+- 机器人使用长轮询，不需要映射端口。
+
 ## Telegram 机器人模式
 1. 在 `config.yaml` 设置 `telegram-bot-token`（或导出 `TELEGRAM_BOT_TOKEN`）。
 2. 可选：设置 `telegram-allowed-chat-ids` 限制使用者。
@@ -52,6 +72,7 @@
 - 超过限制的文件会重新压缩到 `telegram-max-file-mb`（音质可能下降）。
 - 如需中文搜索结果，可设置 `telegram-search-language`（例如 `zh-Hans`）或全局 `language`。
 - 如需“秒传”复用 Telegram 缓存，可设置 `telegram-cache-file` 保存 file_id 缓存。
+- 分享按钮需要在 BotFather 中开启 inline 模式。
 
 ## 下载歌词
 

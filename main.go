@@ -64,12 +64,15 @@ type AudioMeta struct {
 	TrackID   string
 	Title     string
 	Performer string
+	DurationMillis int64
 }
 
 type CachedAudio struct {
 	FileID    string    `json:"file_id"`
 	FileSize  int64     `json:"file_size"`
 	Compressed bool     `json:"compressed"`
+	SizeBytes  int64    `json:"size_bytes,omitempty"`
+	BitrateKbps float64 `json:"bitrate_kbps,omitempty"`
 	Title     string    `json:"title,omitempty"`
 	Performer string    `json:"performer,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
@@ -104,6 +107,7 @@ func recordDownloadedTrack(track *task.Track) {
 		TrackID:   strings.TrimSpace(track.ID),
 		Title:     strings.TrimSpace(track.Resp.Attributes.Name),
 		Performer: strings.TrimSpace(track.Resp.Attributes.ArtistName),
+		DurationMillis: int64(track.Resp.Attributes.DurationInMillis),
 	}
 	if meta.Title != "" || meta.Performer != "" {
 		downloadedMetaMu.Lock()
@@ -2665,6 +2669,7 @@ type Update struct {
 	UpdateID      int            `json:"update_id"`
 	Message       *Message       `json:"message,omitempty"`
 	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
+	InlineQuery   *InlineQuery   `json:"inline_query,omitempty"`
 }
 
 type Message struct {
@@ -2679,6 +2684,12 @@ type CallbackQuery struct {
 	From    *User    `json:"from,omitempty"`
 	Message *Message `json:"message,omitempty"`
 	Data    string   `json:"data,omitempty"`
+}
+
+type InlineQuery struct {
+	ID    string `json:"id"`
+	From  *User  `json:"from,omitempty"`
+	Query string `json:"query"`
 }
 
 type User struct {
@@ -2696,8 +2707,11 @@ type InlineKeyboardMarkup struct {
 }
 
 type InlineKeyboardButton struct {
-	Text         string `json:"text"`
-	CallbackData string `json:"callback_data"`
+	Text                        string `json:"text"`
+	CallbackData                string `json:"callback_data,omitempty"`
+	SwitchInlineQuery           *string `json:"switch_inline_query,omitempty"`
+	SwitchInlineQueryCurrentChat *string `json:"switch_inline_query_current_chat,omitempty"`
+	Url                         string `json:"url,omitempty"`
 }
 
 type ReplyKeyboardMarkup struct {
@@ -2746,6 +2760,13 @@ type Audio struct {
 	FileID       string `json:"file_id"`
 	FileUniqueID string `json:"file_unique_id,omitempty"`
 	FileSize     int64  `json:"file_size,omitempty"`
+}
+
+type InlineQueryResultCachedAudio struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	AudioFileID string `json:"audio_file_id"`
+	Caption     string `json:"caption,omitempty"`
 }
 
 func runTelegramBot(appleToken string) {
@@ -2821,6 +2842,8 @@ func (b *TelegramBot) loop() {
 				b.handleMessage(upd.Message)
 			} else if upd.CallbackQuery != nil {
 				b.handleCallback(upd.CallbackQuery)
+			} else if upd.InlineQuery != nil {
+				b.handleInlineQuery(upd.InlineQuery)
 			}
 		}
 	}
@@ -2934,7 +2957,11 @@ func (b *TelegramBot) getCachedAudio(trackID string, maxBytes int64) (CachedAudi
 	}
 	var best *CachedAudio
 	for _, entry := range candidates {
-		if maxBytes > 0 && entry.FileSize > 0 && entry.FileSize > maxBytes {
+		entrySize := entry.SizeBytes
+		if entrySize <= 0 {
+			entrySize = entry.FileSize
+		}
+		if maxBytes > 0 && entrySize > 0 && entrySize > maxBytes {
 			continue
 		}
 		if best == nil {
@@ -2947,7 +2974,11 @@ func (b *TelegramBot) getCachedAudio(trackID string, maxBytes int64) (CachedAudi
 			best = &copyEntry
 			continue
 		}
-		if best.Compressed == entry.Compressed && entry.FileSize > best.FileSize {
+		bestSize := best.SizeBytes
+		if bestSize <= 0 {
+			bestSize = best.FileSize
+		}
+		if best.Compressed == entry.Compressed && entrySize > bestSize {
 			copyEntry := entry
 			best = &copyEntry
 		}
@@ -2984,7 +3015,7 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 	if strings.HasPrefix(data, "sel:") {
 		numStr := strings.TrimPrefix(data, "sel:")
 		if n, err := strconv.Atoi(numStr); err == nil {
-			b.handleSelection(cb.Message.Chat.ID, n)
+			b.handleSelection(cb.Message.Chat.ID, cb.Message.MessageID, n)
 		}
 	} else if strings.HasPrefix(data, "page:") {
 		deltaStr := strings.TrimPrefix(data, "page:")
@@ -2993,6 +3024,40 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		}
 	}
 	_ = b.answerCallbackQuery(cb.ID)
+}
+
+func (b *TelegramBot) handleInlineQuery(q *InlineQuery) {
+	if q == nil || q.ID == "" {
+		return
+	}
+	if q.From != nil && !b.isAllowedChat(q.From.ID) {
+		return
+	}
+	query := strings.TrimSpace(q.Query)
+	if query == "" {
+		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
+		return
+	}
+	trackID := strings.TrimSpace(query)
+	if strings.HasPrefix(strings.ToLower(trackID), "song:") {
+		trackID = strings.TrimSpace(trackID[5:])
+	}
+	if trackID == "" {
+		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
+		return
+	}
+	entry, ok := b.getCachedAudio(trackID, b.maxFileBytes)
+	if !ok {
+		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
+		return
+	}
+	result := InlineQueryResultCachedAudio{
+		Type:        "audio",
+		ID:          fmt.Sprintf("song_%s", trackID),
+		AudioFileID: entry.FileID,
+		Caption:     formatTelegramCaption(entry.SizeBytes, entry.BitrateKbps),
+	}
+	_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{result}, true)
 }
 
 func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, replyToID int) {
@@ -3150,10 +3215,13 @@ func buildSearchItems(kind string, resp *ampapi.SearchResp) ([]SearchResultItem,
 	return items, hasNext
 }
 
-func (b *TelegramBot) handleSelection(chatID int64, choice int) {
+func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 	pending, ok := b.getPending(chatID)
 	if !ok {
 		_ = b.sendMessage(chatID, "No active selection. Start with /search_song or /search_album.", nil)
+		return
+	}
+	if pending.ResultsMessageID != 0 && messageID != pending.ResultsMessageID {
 		return
 	}
 	replyToID := pending.ReplyToMessageID
@@ -3169,10 +3237,8 @@ func (b *TelegramBot) handleSelection(chatID int64, choice int) {
 	selected := pending.Items[choice-1]
 	switch pending.Kind {
 	case "song":
-		b.clearPending(chatID)
 		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID)
 	case "album":
-		b.clearPending(chatID)
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
 		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, b.searchLanguage())
@@ -3352,7 +3418,7 @@ func (b *TelegramBot) trySendCachedTrack(chatID int64, replyToID int, trackID st
 	if !ok {
 		return false
 	}
-	if err := b.sendAudioByFileID(chatID, entry, replyToID); err != nil {
+	if err := b.sendAudioByFileID(chatID, entry, replyToID, trackID); err != nil {
 		b.deleteCachedAudio(trackID, entry.Compressed)
 		return false
 	}
@@ -3479,6 +3545,17 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	}
 	defer file.Close()
 
+	sizeBytes := info.Size()
+	bitrateKbps := 0.0
+	if hasMeta {
+		bitrateKbps = calcBitrateKbps(sizeBytes, meta.DurationMillis)
+	}
+	caption := formatTelegramCaption(sizeBytes, bitrateKbps)
+	var replyMarkup *InlineKeyboardMarkup
+	if hasMeta {
+		replyMarkup = buildShareKeyboard(meta, displayName)
+	}
+
 	if status != nil {
 		status.Update("Uploading", 0, 0)
 	}
@@ -3499,6 +3576,11 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 			return err
 		}
 	}
+	if caption != "" {
+		if err := writer.WriteField("caption", caption); err != nil {
+			return err
+		}
+	}
 	if hasMeta {
 		if meta.Title != "" {
 			if err := writer.WriteField("title", meta.Title); err != nil {
@@ -3507,6 +3589,14 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		}
 		if meta.Performer != "" {
 			if err := writer.WriteField("performer", meta.Performer); err != nil {
+				return err
+			}
+		}
+	}
+	if replyMarkup != nil {
+		raw, err := json.Marshal(replyMarkup)
+		if err == nil {
+			if err := writer.WriteField("reply_markup", string(raw)); err != nil {
 				return err
 			}
 		}
@@ -3559,6 +3649,8 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 			FileID:     apiResp.Result.Audio.FileID,
 			FileSize:   apiResp.Result.Audio.FileSize,
 			Compressed: compressed,
+			SizeBytes:  sizeBytes,
+			BitrateKbps: bitrateKbps,
 			Title:      meta.Title,
 			Performer:  meta.Performer,
 		})
@@ -3744,6 +3836,86 @@ func formatBytes(value int64) string {
 		precision = 2
 	}
 	return fmt.Sprintf("%.*f%s", precision, size, units[unitIndex])
+}
+
+func calcBitrateKbps(sizeBytes int64, durationMillis int64) float64 {
+	if sizeBytes <= 0 || durationMillis <= 0 {
+		return 0
+	}
+	seconds := float64(durationMillis) / 1000.0
+	if seconds <= 0 {
+		return 0
+	}
+	return (float64(sizeBytes) * 8.0) / (seconds * 1000.0)
+}
+
+func formatTelegramCaption(sizeBytes int64, bitrateKbps float64) string {
+	sizeMB := float64(sizeBytes) / (1024.0 * 1024.0)
+	if sizeMB < 0 {
+		sizeMB = 0
+	}
+	if bitrateKbps < 0 {
+		bitrateKbps = 0
+	}
+	return fmt.Sprintf("#AppleMusic #flac 文件大小%.2fMB %.2fkbps\nvia @ultimateapplemusicdownloaderbot", sizeMB, bitrateKbps)
+}
+
+func buildShareKeyboard(meta AudioMeta, fallback string) *InlineKeyboardMarkup {
+	trackID := strings.TrimSpace(meta.TrackID)
+	if trackID == "" {
+		return nil
+	}
+	title := strings.TrimSpace(meta.Title)
+	performer := strings.TrimSpace(meta.Performer)
+	shareText := ""
+	if performer != "" && title != "" {
+		shareText = performer + " - " + title
+	} else if title != "" {
+		shareText = title
+	} else if performer != "" {
+		shareText = performer
+	} else {
+		shareText = strings.TrimSpace(fallback)
+	}
+	shareText = trimInlineText(shareText, 64)
+	if shareText == "" {
+		shareText = "Share"
+	}
+	return &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{
+					Text:              shareText,
+					SwitchInlineQuery: strPtr("song:" + trackID),
+				},
+			},
+			{
+				{
+					Text:              "Send me to...",
+					SwitchInlineQuery: strPtr(""),
+				},
+			},
+		},
+	}
+}
+
+func trimInlineText(text string, maxRunes int) string {
+	text = strings.TrimSpace(text)
+	if maxRunes <= 0 || text == "" {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "..."
+}
+
+func strPtr(value string) *string {
+	return &value
 }
 
 func findCoverFile(dir string) string {
@@ -3979,16 +4151,30 @@ func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, mark
 	return apiResp.Result.MessageID, nil
 }
 
-func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyToID int) error {
+func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyToID int, trackID string) error {
+	sizeBytes := entry.SizeBytes
+	if sizeBytes <= 0 {
+		sizeBytes = entry.FileSize
+	}
+	caption := formatTelegramCaption(sizeBytes, entry.BitrateKbps)
 	payload := map[string]any{
 		"chat_id": chatID,
 		"audio":   entry.FileID,
+		"caption": caption,
 	}
 	if entry.Title != "" {
 		payload["title"] = entry.Title
 	}
 	if entry.Performer != "" {
 		payload["performer"] = entry.Performer
+	}
+	meta := AudioMeta{
+		TrackID:   trackID,
+		Title:     entry.Title,
+		Performer: entry.Performer,
+	}
+	if markup := buildShareKeyboard(meta, ""); markup != nil {
+		payload["reply_markup"] = markup
 	}
 	if replyToID > 0 {
 		payload["reply_to_message_id"] = replyToID
@@ -4033,6 +4219,33 @@ func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
 		return err
 	}
 	req, err := http.NewRequest("POST", b.apiURL("answerCallbackQuery"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func (b *TelegramBot) answerInlineQuery(inlineQueryID string, results any, personal bool) error {
+	if inlineQueryID == "" {
+		return nil
+	}
+	payload := map[string]any{
+		"inline_query_id": inlineQueryID,
+		"results":         results,
+		"is_personal":     personal,
+		"cache_time":      0,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("answerInlineQuery"), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

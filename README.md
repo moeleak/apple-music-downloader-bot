@@ -77,6 +77,26 @@ docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config
 
 [Chinese tutorial - see Method 3 for details](https://telegra.ph/Apple-Music-Alac高解析度无损音乐下载教程-04-02-2)
 
+## Docker
+Build the image:
+```
+docker build -t apple-music-dl .
+```
+
+Run the bot:
+```
+docker run --rm -it \
+  -v "$PWD/config.yaml":/app/config.yaml \
+  -v "$PWD/downloads":/downloads \
+  -v "$PWD/telegram-cache.json":/app/telegram-cache.json \
+  -e TELEGRAM_BOT_TOKEN=your_bot_token \
+  apple-music-dl --bot
+```
+
+Notes:
+- Mount `telegram-cache.json` only if you enable `telegram-cache-file`.
+- The bot uses long polling; no port mapping is required.
+
 ## Telegram bot mode
 1. Set `telegram-bot-token` in `config.yaml` (or export `TELEGRAM_BOT_TOKEN`).
 2. Optional: set `telegram-allowed-chat-ids` to restrict usage.
@@ -92,6 +112,7 @@ Notes:
 - Large files are re-encoded to fit `telegram-max-file-mb` (quality may be reduced).
 - For localized search results, set `telegram-search-language` (e.g. `zh-Hans`) or the global `language`.
 - To enable instant re-sends, set `telegram-cache-file` so the bot can reuse Telegram file IDs.
+- Share buttons require enabling inline mode in BotFather.
 
 ## Downloading lyrics
 
