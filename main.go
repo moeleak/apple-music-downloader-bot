@@ -3947,18 +3947,19 @@ func buildShareKeyboard(meta AudioMeta, fallback string) *InlineKeyboardMarkup {
 	if shareText == "" {
 		shareText = "Share"
 	}
+	query := "song:" + trackID
 	return &InlineKeyboardMarkup{
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{
-					Text:              shareText,
-					SwitchInlineQuery: strPtr("song:" + trackID),
+					Text:                         shareText,
+					SwitchInlineQueryCurrentChat: strPtr(query),
 				},
 			},
 			{
 				{
 					Text:              "Send me to...",
-					SwitchInlineQuery: strPtr(""),
+					SwitchInlineQuery: strPtr(query),
 				},
 			},
 		},
