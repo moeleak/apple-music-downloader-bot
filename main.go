@@ -73,6 +73,7 @@ type CachedAudio struct {
 	Compressed bool     `json:"compressed"`
 	SizeBytes  int64    `json:"size_bytes,omitempty"`
 	BitrateKbps float64 `json:"bitrate_kbps,omitempty"`
+	DurationMillis int64 `json:"duration_millis,omitempty"`
 	Title     string    `json:"title,omitempty"`
 	Performer string    `json:"performer,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
@@ -2912,6 +2913,62 @@ func (b *TelegramBot) saveCacheLocked() {
 	_ = os.Rename(tmp, b.cacheFile)
 }
 
+func (b *TelegramBot) fetchTrackMeta(trackID string) (AudioMeta, error) {
+	if trackID == "" {
+		return AudioMeta{}, fmt.Errorf("empty track id")
+	}
+	resp, err := ampapi.GetSongResp(Config.Storefront, trackID, b.searchLanguage(), b.appleToken)
+	if err != nil || resp == nil || len(resp.Data) == 0 {
+		if err != nil {
+			return AudioMeta{}, err
+		}
+		return AudioMeta{}, fmt.Errorf("empty song response")
+	}
+	data := resp.Data[0]
+	return AudioMeta{
+		TrackID:        trackID,
+		Title:          strings.TrimSpace(data.Attributes.Name),
+		Performer:      strings.TrimSpace(data.Attributes.ArtistName),
+		DurationMillis: int64(data.Attributes.DurationInMillis),
+	}, nil
+}
+
+func (b *TelegramBot) enrichCachedAudio(trackID string, entry CachedAudio) CachedAudio {
+	updated := false
+	sizeBytes := entry.SizeBytes
+	if sizeBytes <= 0 {
+		sizeBytes = entry.FileSize
+		if sizeBytes > 0 {
+			entry.SizeBytes = sizeBytes
+			updated = true
+		}
+	}
+	if trackID != "" && (entry.DurationMillis <= 0 || entry.Title == "" || entry.Performer == "") {
+		if meta, err := b.fetchTrackMeta(trackID); err == nil {
+			if entry.DurationMillis <= 0 && meta.DurationMillis > 0 {
+				entry.DurationMillis = meta.DurationMillis
+				updated = true
+			}
+			if entry.Title == "" && meta.Title != "" {
+				entry.Title = meta.Title
+				updated = true
+			}
+			if entry.Performer == "" && meta.Performer != "" {
+				entry.Performer = meta.Performer
+				updated = true
+			}
+		}
+	}
+	if entry.BitrateKbps <= 0 && sizeBytes > 0 && entry.DurationMillis > 0 {
+		entry.BitrateKbps = calcBitrateKbps(sizeBytes, entry.DurationMillis)
+		updated = true
+	}
+	if updated && trackID != "" {
+		b.storeCachedAudio(trackID, entry)
+	}
+	return entry
+}
+
 func (b *TelegramBot) storeCachedAudio(trackID string, entry CachedAudio) {
 	if trackID == "" || entry.FileID == "" {
 		return
@@ -3051,6 +3108,7 @@ func (b *TelegramBot) handleInlineQuery(q *InlineQuery) {
 		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
 		return
 	}
+	entry = b.enrichCachedAudio(trackID, entry)
 	result := InlineQueryResultCachedAudio{
 		Type:        "audio",
 		ID:          fmt.Sprintf("song_%s", trackID),
@@ -3546,9 +3604,16 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	defer file.Close()
 
 	sizeBytes := info.Size()
-	bitrateKbps := 0.0
+	durationMillis := int64(0)
 	if hasMeta {
-		bitrateKbps = calcBitrateKbps(sizeBytes, meta.DurationMillis)
+		durationMillis = meta.DurationMillis
+	}
+	bitrateKbps := calcBitrateKbps(sizeBytes, durationMillis)
+	if bitrateKbps <= 0 {
+		if seconds, err := getAudioDurationSeconds(sendPath); err == nil && seconds > 0 {
+			durationMillis = int64(seconds * 1000.0)
+			bitrateKbps = calcBitrateKbps(sizeBytes, durationMillis)
+		}
 	}
 	caption := formatTelegramCaption(sizeBytes, bitrateKbps)
 	var replyMarkup *InlineKeyboardMarkup
@@ -3651,6 +3716,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 			Compressed: compressed,
 			SizeBytes:  sizeBytes,
 			BitrateKbps: bitrateKbps,
+			DurationMillis: durationMillis,
 			Title:      meta.Title,
 			Performer:  meta.Performer,
 		})
@@ -4152,11 +4218,13 @@ func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, mark
 }
 
 func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyToID int, trackID string) error {
+	entry = b.enrichCachedAudio(trackID, entry)
 	sizeBytes := entry.SizeBytes
 	if sizeBytes <= 0 {
 		sizeBytes = entry.FileSize
 	}
-	caption := formatTelegramCaption(sizeBytes, entry.BitrateKbps)
+	bitrateKbps := entry.BitrateKbps
+	caption := formatTelegramCaption(sizeBytes, bitrateKbps)
 	payload := map[string]any{
 		"chat_id": chatID,
 		"audio":   entry.FileID,
