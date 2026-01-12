@@ -3149,6 +3149,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 		dl_song = false
 		return
 	}
+	defer status.Stop()
 
 	progress := func(phase string, done, total int64) {
 		status.Update(phase, done, total)
@@ -3159,7 +3160,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 	status.Update("Downloading", 0, 0)
 	err = fn()
 	if err != nil {
-		status.Update(fmt.Sprintf("Failed: %v", err), 0, 0)
+		status.UpdateSync(fmt.Sprintf("Failed: %v", err), 0, 0)
 		dl_song = false
 		return
 	}
@@ -3169,7 +3170,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 
 	paths := append([]string{}, lastDownloadedPaths...)
 	if len(paths) == 0 {
-		status.Update("No files were downloaded.", 0, 0)
+		status.UpdateSync("No files were downloaded.", 0, 0)
 		return
 	}
 	sentAny := false
@@ -3181,6 +3182,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 		sentAny = true
 	}
 	if sentAny {
+		status.Stop()
 		_ = b.deleteMessage(chatID, status.messageID)
 	}
 }
@@ -3316,6 +3318,13 @@ type DownloadStatus struct {
 	lastText    string
 	lastUpdate  time.Time
 	mu          sync.Mutex
+	latestPhase string
+	latestDone  int64
+	latestTotal int64
+	dirty       bool
+	updateCh    chan struct{}
+	stopCh      chan struct{}
+	stopOnce    sync.Once
 }
 
 func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int) (*DownloadStatus, error) {
@@ -3323,11 +3332,24 @@ func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int) (*Download
 	if err != nil {
 		return nil, err
 	}
-	return &DownloadStatus{
+	status := &DownloadStatus{
 		bot:       bot,
 		chatID:    chatID,
 		messageID: messageID,
-	}, nil
+		updateCh:  make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+	}
+	go status.loop()
+	return status, nil
+}
+
+func (s *DownloadStatus) Stop() {
+	if s == nil || s.bot == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 }
 
 func (s *DownloadStatus) Update(phase string, done, total int64) {
@@ -3335,12 +3357,68 @@ func (s *DownloadStatus) Update(phase string, done, total int64) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.setLatestLocked(phase, done, total)
+	s.mu.Unlock()
+	select {
+	case s.updateCh <- struct{}{}:
+	default:
+	}
+}
 
+func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
+	if s == nil || s.bot == nil {
+		return
+	}
+	s.mu.Lock()
+	s.setLatestLocked(phase, done, total)
+	s.mu.Unlock()
+	s.flush(true)
+}
+
+func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
 	normalizedPhase := strings.TrimSpace(phase)
 	if normalizedPhase == "" {
 		normalizedPhase = "Working"
 	}
+	s.latestPhase = normalizedPhase
+	s.latestDone = done
+	s.latestTotal = total
+	s.dirty = true
+}
+
+func (s *DownloadStatus) loop() {
+	ticker := time.NewTicker(1500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.updateCh:
+			s.flush(false)
+		case <-ticker.C:
+			s.flush(false)
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+func (s *DownloadStatus) flush(force bool) {
+	if s == nil || s.bot == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.dirty && !force {
+		s.mu.Unlock()
+		return
+	}
+	phase := s.latestPhase
+	done := s.latestDone
+	total := s.latestTotal
+	s.dirty = false
+	lastPhase := s.lastPhase
+	lastPercent := s.lastPercent
+	lastText := s.lastText
+	lastUpdate := s.lastUpdate
+	s.mu.Unlock()
 
 	percent := -1
 	if total > 0 {
@@ -3353,25 +3431,31 @@ func (s *DownloadStatus) Update(phase string, done, total int64) {
 		}
 	}
 
-	text := formatProgressText(normalizedPhase, done, total, percent)
+	text := formatProgressText(phase, done, total, percent)
 	now := time.Now()
-	phaseChanged := normalizedPhase != s.lastPhase
-	percentChanged := percent != s.lastPercent && percent >= 0
-	if text == s.lastText {
-		return
-	}
-	if !phaseChanged && !percentChanged && now.Sub(s.lastUpdate) < 2*time.Second {
-		return
+	phaseChanged := phase != lastPhase
+	percentChanged := percent != lastPercent && percent >= 0
+	if !force {
+		if text == lastText {
+			return
+		}
+		if !phaseChanged && !percentChanged && now.Sub(lastUpdate) < 2*time.Second {
+			return
+		}
 	}
 
 	if err := s.bot.editMessageText(s.chatID, s.messageID, text, nil); err != nil {
-		s.lastUpdate = now
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
 		return
 	}
-	s.lastPhase = normalizedPhase
+	s.mu.Lock()
+	s.lastPhase = phase
 	s.lastPercent = percent
 	s.lastText = text
 	s.lastUpdate = now
+	s.mu.Unlock()
 }
 
 func formatProgressText(phase string, done, total int64, percent int) string {
