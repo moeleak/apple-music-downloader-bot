@@ -2628,6 +2628,7 @@ const (
 	defaultQueueSize  = 20
 	pendingTTL         = 10 * time.Minute
 	defaultTelegramFormat = "alac"
+	telegramDownloadMaxBytes int64 = 10 * 1024 * 1024 * 1024
 )
 
 const (
@@ -2661,6 +2662,7 @@ type TelegramBot struct {
 type PendingSelection struct {
 	Kind             string
 	Query            string
+	Title            string
 	Offset           int
 	HasNext          bool
 	Items            []SearchResultItem
@@ -3381,7 +3383,7 @@ func (b *TelegramBot) handleSearch(chatID int64, kind string, query string, repl
 	if err != nil {
 		return
 	}
-	b.setPending(chatID, kind, query, offset, items, hasNext, replyToID, messageID)
+	b.setPending(chatID, kind, query, offset, items, hasNext, replyToID, messageID, "")
 }
 
 func (b *TelegramBot) searchLanguage() string {
@@ -3482,10 +3484,10 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 	switch pending.Kind {
 	case "song":
 		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID)
-	case "album":
+	case "album", "artist_album":
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
-		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, b.searchLanguage())
+		albums, hasNext, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, 0, b.searchLanguage())
 		if err != nil {
 			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
 			return
@@ -3495,11 +3497,11 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 			return
 		}
 		message := formatArtistAlbums(selected.Name, albums)
-		messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(albums), false, false), replyToID)
+		messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(albums), false, hasNext), replyToID)
 		if err != nil {
 			return
 		}
-		b.setPending(chatID, "album", "", 0, albums, false, replyToID, messageID)
+		b.setPending(chatID, "artist_album", selected.ID, 0, albums, hasNext, replyToID, messageID, selected.Name)
 	default:
 		b.clearPending(chatID)
 	}
@@ -3520,49 +3522,70 @@ func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
 	if newOffset < 0 {
 		return
 	}
-	items, hasNext, err := b.fetchSearchPage(pending.Kind, pending.Query, newOffset)
-	if err != nil {
-		_ = b.editMessageText(chatID, messageID, fmt.Sprintf("Search failed: %v", err), nil)
+	var (
+		items   []SearchResultItem
+		hasNext bool
+		err     error
+		message string
+	)
+	switch pending.Kind {
+	case "song", "album", "artist":
+		items, hasNext, err = b.fetchSearchPage(pending.Kind, pending.Query, newOffset)
+		if err != nil {
+			_ = b.editMessageText(chatID, messageID, fmt.Sprintf("Search failed: %v", err), nil)
+			return
+		}
+		if len(items) == 0 {
+			return
+		}
+		message = formatSearchResults(pending.Kind, pending.Query, items)
+	case "artist_album":
+		items, hasNext, err = fetchArtistAlbums(Config.Storefront, pending.Query, b.appleToken, b.searchLimit, newOffset, b.searchLanguage())
+		if err != nil {
+			_ = b.editMessageText(chatID, messageID, fmt.Sprintf("Failed to load artist albums: %v", err), nil)
+			return
+		}
+		if len(items) == 0 {
+			return
+		}
+		message = formatArtistAlbums(pending.Title, items)
+	default:
 		return
 	}
-	if len(items) == 0 {
-		return
-	}
-	message := formatSearchResults(pending.Kind, pending.Query, items)
 	_ = b.editMessageText(chatID, messageID, message, buildInlineKeyboard(len(items), newOffset > 0, hasNext))
-	b.setPending(chatID, pending.Kind, pending.Query, newOffset, items, hasNext, pending.ReplyToMessageID, messageID)
+	b.setPending(chatID, pending.Kind, pending.Query, newOffset, items, hasNext, pending.ReplyToMessageID, messageID, pending.Title)
 }
 
-func fetchArtistAlbums(storefront, artistID, token string, limit int, language string) ([]SearchResultItem, error) {
-	offset := 0
+func fetchArtistAlbums(storefront, artistID, token string, limit int, pageOffset int, language string) ([]SearchResultItem, bool, error) {
+	apiOffset := 0
 	items := []SearchResultItem{}
 	for {
 		req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s/albums", storefront, artistID), nil)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 		req.Header.Set("Origin", "https://music.apple.com")
 		query := url.Values{}
 		query.Set("limit", "100")
-		query.Set("offset", strconv.Itoa(offset))
+		query.Set("offset", strconv.Itoa(apiOffset))
 		if language != "" {
 			query.Set("l", language)
 		}
 		req.URL.RawQuery = query.Encode()
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			return nil, fmt.Errorf("artist albums request failed: %s", resp.Status)
+			return nil, false, fmt.Errorf("artist albums request failed: %s", resp.Status)
 		}
 		obj := new(structs.AutoGeneratedArtist)
 		if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
 			resp.Body.Close()
-			return nil, err
+			return nil, false, err
 		}
 		resp.Body.Close()
 		for _, album := range obj.Data {
@@ -3577,7 +3600,7 @@ func fetchArtistAlbums(storefront, artistID, token string, limit int, language s
 		if obj.Next == "" {
 			break
 		}
-		offset += 100
+		apiOffset += 100
 	}
 	sort.Slice(items, func(i, j int) bool {
 		di, err1 := time.Parse("2006-01-02", items[i].Detail)
@@ -3587,10 +3610,21 @@ func fetchArtistAlbums(storefront, artistID, token string, limit int, language s
 		}
 		return di.After(dj)
 	})
-	if limit > 0 && len(items) > limit {
-		return items[:limit], nil
+	if pageOffset < 0 {
+		pageOffset = 0
 	}
-	return items, nil
+	if limit <= 0 {
+		return items, false, nil
+	}
+	if pageOffset >= len(items) {
+		return []SearchResultItem{}, false, nil
+	}
+	end := pageOffset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	hasNext := end < len(items)
+	return items[pageOffset:end], hasNext, nil
 }
 
 func (b *TelegramBot) queueDownloadSong(chatID int64, songID string) {
@@ -3694,6 +3728,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 	if format == "" {
 		format = defaultTelegramFormat
 	}
+	defer b.cleanupDownloadsIfNeeded()
 	Config.ConvertAfterDownload = format == telegramFormatFlac
 	if format == telegramFormatFlac {
 		Config.ConvertFormat = telegramFormatFlac
@@ -3750,6 +3785,90 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.messageID)
 	}
+}
+
+type downloadFileEntry struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+func (b *TelegramBot) cleanupDownloadsIfNeeded() {
+	root := strings.TrimSpace(Config.AlacSaveFolder)
+	if root == "" {
+		return
+	}
+	cleanRoot := filepath.Clean(root)
+	if cleanRoot == "." || cleanRoot == string(filepath.Separator) {
+		fmt.Printf("Skip cleanup for unsafe download folder: %s\n", root)
+		return
+	}
+	info, err := os.Stat(cleanRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		fmt.Printf("Download folder check failed: %v\n", err)
+		return
+	}
+	if !info.IsDir() {
+		return
+	}
+	totalSize, files, err := scanDownloadFolder(cleanRoot, Config.TelegramCacheFile)
+	if err != nil {
+		fmt.Printf("Download folder scan failed: %v\n", err)
+		return
+	}
+	if totalSize <= telegramDownloadMaxBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+	for _, entry := range files {
+		if totalSize <= telegramDownloadMaxBytes {
+			break
+		}
+		if err := os.Remove(entry.path); err != nil {
+			continue
+		}
+		totalSize -= entry.size
+	}
+}
+
+func scanDownloadFolder(root string, cacheFile string) (int64, []downloadFileEntry, error) {
+	var totalSize int64
+	entries := []downloadFileEntry{}
+	cachePath := ""
+	if cacheFile != "" {
+		cachePath = filepath.Clean(cacheFile)
+	}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		if cachePath != "" && filepath.Clean(path) == cachePath {
+			return nil
+		}
+		size := info.Size()
+		totalSize += size
+		entries = append(entries, downloadFileEntry{
+			path:    path,
+			size:    size,
+			modTime: info.ModTime(),
+		})
+		return nil
+	})
+	if err != nil {
+		return totalSize, entries, err
+	}
+	return totalSize, entries, nil
 }
 
 func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int, status *DownloadStatus, format string) error {
@@ -4613,12 +4732,13 @@ func (b *TelegramBot) isAllowedChat(chatID int64) bool {
 	return b.allowedChats[chatID]
 }
 
-func (b *TelegramBot) setPending(chatID int64, kind string, query string, offset int, items []SearchResultItem, hasNext bool, replyToID int, resultsMessageID int) {
+func (b *TelegramBot) setPending(chatID int64, kind string, query string, offset int, items []SearchResultItem, hasNext bool, replyToID int, resultsMessageID int, title string) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	b.pending[chatID] = &PendingSelection{
 		Kind:             kind,
 		Query:            query,
+		Title:            title,
 		Offset:           offset,
 		HasNext:          hasNext,
 		Items:            items,
