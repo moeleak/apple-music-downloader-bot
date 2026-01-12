@@ -56,7 +56,14 @@ var (
 	okDict         = make(map[string][]int)
 	lastDownloadedPaths []string
 	activeProgress func(phase string, done, total int64)
+	downloadedMetaMu sync.Mutex
+	downloadedMeta   = make(map[string]AudioMeta)
 )
+
+type AudioMeta struct {
+	Title     string
+	Performer string
+}
 
 func loadConfig() error {
 	data, err := os.ReadFile("config.yaml")
@@ -73,11 +80,27 @@ func loadConfig() error {
 	return nil
 }
 
-func recordDownloadedPath(path string) {
-	if path == "" {
+func recordDownloadedTrack(track *task.Track) {
+	if track == nil || track.SavePath == "" {
 		return
 	}
-	lastDownloadedPaths = append(lastDownloadedPaths, path)
+	lastDownloadedPaths = append(lastDownloadedPaths, track.SavePath)
+	meta := AudioMeta{
+		Title:     strings.TrimSpace(track.Resp.Attributes.Name),
+		Performer: strings.TrimSpace(track.Resp.Attributes.ArtistName),
+	}
+	if meta.Title != "" || meta.Performer != "" {
+		downloadedMetaMu.Lock()
+		downloadedMeta[track.SavePath] = meta
+		downloadedMetaMu.Unlock()
+	}
+}
+
+func getDownloadedMeta(path string) (AudioMeta, bool) {
+	downloadedMetaMu.Lock()
+	defer downloadedMetaMu.Unlock()
+	meta, ok := downloadedMeta[path]
+	return meta, ok
 }
 
 func LimitString(s string) string {
@@ -955,7 +978,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 				convertIfNeeded(track)
 			}
 		}
-		recordDownloadedPath(track.SavePath)
+		recordDownloadedTrack(track)
 		counter.Success++
 		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 		return
@@ -966,7 +989,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			fmt.Println("Converted track already exists locally.")
 			track.SavePath = convertedPath
 			track.SaveName = filepath.Base(convertedPath)
-			recordDownloadedPath(track.SavePath)
+			recordDownloadedTrack(track)
 			counter.Success++
 			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 			return
@@ -1043,7 +1066,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	// CONVERSION FEATURE hook
 	convertIfNeeded(track)
 
-	recordDownloadedPath(track.SavePath)
+	recordDownloadedTrack(track)
 	counter.Success++
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
@@ -3094,6 +3117,9 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 	defer b.releaseDownload()
 
 	lastDownloadedPaths = nil
+	downloadedMetaMu.Lock()
+	downloadedMeta = make(map[string]AudioMeta)
+	downloadedMetaMu.Unlock()
 	counter = structs.Counter{}
 	okDict = make(map[string][]int)
 
@@ -3223,6 +3249,18 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 			return err
 		}
 	}
+	if meta, ok := getDownloadedMeta(filePath); ok {
+		if meta.Title != "" {
+			if err := writer.WriteField("title", meta.Title); err != nil {
+				return err
+			}
+		}
+		if meta.Performer != "" {
+			if err := writer.WriteField("performer", meta.Performer); err != nil {
+				return err
+			}
+		}
+	}
 	part, err := writer.CreateFormFile("audio", displayName)
 	if err != nil {
 		return err
@@ -3326,7 +3364,10 @@ func (s *DownloadStatus) Update(phase string, done, total int64) {
 		return
 	}
 
-	_ = s.bot.editMessageText(s.chatID, s.messageID, text, nil)
+	if err := s.bot.editMessageText(s.chatID, s.messageID, text, nil); err != nil {
+		s.lastUpdate = now
+		return
+	}
 	s.lastPhase = normalizedPhase
 	s.lastPercent = percent
 	s.lastText = text
@@ -3357,7 +3398,11 @@ func formatBytes(value int64) string {
 		size /= 1024
 		unitIndex++
 	}
-	return fmt.Sprintf("%.1f%s", size, units[unitIndex])
+	precision := 1
+	if unitIndex >= 2 {
+		precision = 2
+	}
+	return fmt.Sprintf("%.*f%s", precision, size, units[unitIndex])
 }
 
 func findCoverFile(dir string) string {
@@ -3643,6 +3688,32 @@ func (b *TelegramBot) editMessageText(chatID int64, messageID int, text string, 
 		return err
 	}
 	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		apiResp := apiResponse{}
+		if err := json.Unmarshal(responseBody, &apiResp); err == nil {
+			if strings.Contains(apiResp.Description, "message is not modified") {
+				return nil
+			}
+			if apiResp.Description != "" {
+				return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+			}
+		}
+		return fmt.Errorf("telegram editMessageText failed: %s", strings.TrimSpace(string(responseBody)))
+	}
+	apiResp := apiResponse{}
+	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
+		return err
+	}
+	if !apiResp.OK {
+		if strings.Contains(apiResp.Description, "message is not modified") {
+			return nil
+		}
+		return fmt.Errorf("telegram editMessageText error: %s", apiResp.Description)
+	}
 	return nil
 }
 
