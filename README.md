@@ -90,6 +90,8 @@ docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config
 Notes:
 - The bot sends FLAC, so `ffmpeg` must be available.
 - Large files are re-encoded to fit `telegram-max-file-mb` (quality may be reduced).
+- For localized search results, set `telegram-search-language` (e.g. `zh-Hans`) or the global `language`.
+- To enable instant re-sends, set `telegram-cache-file` so the bot can reuse Telegram file IDs.
 
 ## Downloading lyrics
 

@@ -49,8 +49,10 @@ type ConfigSet struct {
 	TelegramBotToken           string  `yaml:"telegram-bot-token"`
 	TelegramAllowedChatIDs     []int64 `yaml:"telegram-allowed-chat-ids"`
 	TelegramSearchLimit        int     `yaml:"telegram-search-limit"`
+	TelegramSearchLanguage     string  `yaml:"telegram-search-language"`
 	TelegramMaxFileMB          int     `yaml:"telegram-max-file-mb"`
 	TelegramDownloadFolder     string  `yaml:"telegram-download-folder"`
+	TelegramCacheFile          string  `yaml:"telegram-cache-file"`
 }
 
 type Counter struct {

@@ -50,6 +50,8 @@
 注意：
 - 机器人会发送 FLAC，需要系统有 `ffmpeg`。
 - 超过限制的文件会重新压缩到 `telegram-max-file-mb`（音质可能下降）。
+- 如需中文搜索结果，可设置 `telegram-search-language`（例如 `zh-Hans`）或全局 `language`。
+- 如需“秒传”复用 Telegram 缓存，可设置 `telegram-cache-file` 保存 file_id 缓存。
 
 ## 下载歌词
 

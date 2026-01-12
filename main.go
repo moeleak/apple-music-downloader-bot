@@ -61,8 +61,23 @@ var (
 )
 
 type AudioMeta struct {
+	TrackID   string
 	Title     string
 	Performer string
+}
+
+type CachedAudio struct {
+	FileID    string    `json:"file_id"`
+	FileSize  int64     `json:"file_size"`
+	Compressed bool     `json:"compressed"`
+	Title     string    `json:"title,omitempty"`
+	Performer string    `json:"performer,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
+type telegramCacheFile struct {
+	Version int                    `json:"version"`
+	Items   map[string]CachedAudio `json:"items"`
 }
 
 func loadConfig() error {
@@ -86,6 +101,7 @@ func recordDownloadedTrack(track *task.Track) {
 	}
 	lastDownloadedPaths = append(lastDownloadedPaths, track.SavePath)
 	meta := AudioMeta{
+		TrackID:   strings.TrimSpace(track.ID),
 		Title:     strings.TrimSpace(track.Resp.Attributes.Name),
 		Performer: strings.TrimSpace(track.Resp.Attributes.ArtistName),
 	}
@@ -2621,6 +2637,10 @@ type TelegramBot struct {
 	queueMu       sync.Mutex
 	downloadQueue chan *downloadRequest
 	inProgress    bool
+
+	cacheMu   sync.Mutex
+	cacheFile string
+	cache     map[string]CachedAudio
 }
 
 type PendingSelection struct {
@@ -2711,6 +2731,23 @@ type sendMessageResponse struct {
 	Description string  `json:"description,omitempty"`
 }
 
+type sendAudioResponse struct {
+	OK          bool   `json:"ok"`
+	Result      AudioMessage `json:"result"`
+	Description string `json:"description,omitempty"`
+}
+
+type AudioMessage struct {
+	MessageID int   `json:"message_id"`
+	Audio     Audio `json:"audio"`
+}
+
+type Audio struct {
+	FileID       string `json:"file_id"`
+	FileUniqueID string `json:"file_unique_id,omitempty"`
+	FileSize     int64  `json:"file_size,omitempty"`
+}
+
 func runTelegramBot(appleToken string) {
 	botToken := strings.TrimSpace(Config.TelegramBotToken)
 	if botToken == "" {
@@ -2742,6 +2779,10 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	if maxFileBytes <= 0 {
 		maxFileBytes = 50 * 1024 * 1024
 	}
+	cacheFile := strings.TrimSpace(Config.TelegramCacheFile)
+	if cacheFile == "" {
+		cacheFile = "telegram-cache.json"
+	}
 	queueSize := defaultQueueSize
 	if queueSize <= 0 {
 		queueSize = 1
@@ -2755,7 +2796,10 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		maxFileBytes: maxFileBytes,
 		pending:      make(map[int64]*PendingSelection),
 		downloadQueue: make(chan *downloadRequest, queueSize),
+		cacheFile:     cacheFile,
+		cache:         make(map[string]CachedAudio),
 	}
+	bot.loadCache()
 	bot.startDownloadWorker()
 	return bot
 }
@@ -2796,6 +2840,122 @@ func (b *TelegramBot) startDownloadWorker() {
 			b.queueMu.Unlock()
 		}
 	}()
+}
+
+func (b *TelegramBot) cacheKey(trackID string, compressed bool) string {
+	return fmt.Sprintf("%s|%t", trackID, compressed)
+}
+
+func (b *TelegramBot) loadCache() {
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	b.cache = make(map[string]CachedAudio)
+	if b.cacheFile == "" {
+		return
+	}
+	data, err := os.ReadFile(b.cacheFile)
+	if err != nil {
+		return
+	}
+	var payload telegramCacheFile
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	if payload.Items != nil {
+		b.cache = payload.Items
+	}
+}
+
+func (b *TelegramBot) saveCacheLocked() {
+	if b.cacheFile == "" {
+		return
+	}
+	dir := filepath.Dir(b.cacheFile)
+	if dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	payload := telegramCacheFile{
+		Version: 1,
+		Items:   b.cache,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := b.cacheFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, b.cacheFile)
+}
+
+func (b *TelegramBot) storeCachedAudio(trackID string, entry CachedAudio) {
+	if trackID == "" || entry.FileID == "" {
+		return
+	}
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	if b.cache == nil {
+		b.cache = make(map[string]CachedAudio)
+	}
+	entry.UpdatedAt = time.Now()
+	b.cache[b.cacheKey(trackID, entry.Compressed)] = entry
+	b.saveCacheLocked()
+}
+
+func (b *TelegramBot) deleteCachedAudio(trackID string, compressed bool) {
+	if trackID == "" {
+		return
+	}
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	if b.cache == nil {
+		return
+	}
+	delete(b.cache, b.cacheKey(trackID, compressed))
+	b.saveCacheLocked()
+}
+
+func (b *TelegramBot) getCachedAudio(trackID string, maxBytes int64) (CachedAudio, bool) {
+	if trackID == "" {
+		return CachedAudio{}, false
+	}
+	b.cacheMu.Lock()
+	defer b.cacheMu.Unlock()
+	if b.cache == nil {
+		return CachedAudio{}, false
+	}
+	var candidates []CachedAudio
+	if entry, ok := b.cache[b.cacheKey(trackID, false)]; ok {
+		candidates = append(candidates, entry)
+	}
+	if entry, ok := b.cache[b.cacheKey(trackID, true)]; ok {
+		candidates = append(candidates, entry)
+	}
+	var best *CachedAudio
+	for _, entry := range candidates {
+		if maxBytes > 0 && entry.FileSize > 0 && entry.FileSize > maxBytes {
+			continue
+		}
+		if best == nil {
+			copyEntry := entry
+			best = &copyEntry
+			continue
+		}
+		if best.Compressed && !entry.Compressed {
+			copyEntry := entry
+			best = &copyEntry
+			continue
+		}
+		if best.Compressed == entry.Compressed && entry.FileSize > best.FileSize {
+			copyEntry := entry
+			best = &copyEntry
+		}
+	}
+	if best == nil {
+		return CachedAudio{}, false
+	}
+	return *best, true
 }
 
 func (b *TelegramBot) handleMessage(msg *Message) {
@@ -2915,9 +3075,17 @@ func (b *TelegramBot) handleSearch(chatID int64, kind string, query string, repl
 	b.setPending(chatID, kind, query, offset, items, hasNext, replyToID, messageID)
 }
 
+func (b *TelegramBot) searchLanguage() string {
+	lang := strings.TrimSpace(Config.TelegramSearchLanguage)
+	if lang == "" {
+		lang = strings.TrimSpace(Config.Language)
+	}
+	return lang
+}
+
 func (b *TelegramBot) fetchSearchPage(kind string, query string, offset int) ([]SearchResultItem, bool, error) {
 	apiType := kind + "s"
-	resp, err := ampapi.Search(Config.Storefront, query, apiType, Config.Language, b.appleToken, b.searchLimit, offset)
+	resp, err := ampapi.Search(Config.Storefront, query, apiType, b.searchLanguage(), b.appleToken, b.searchLimit, offset)
 	if err != nil {
 		return nil, false, err
 	}
@@ -3007,7 +3175,7 @@ func (b *TelegramBot) handleSelection(chatID int64, choice int) {
 		b.clearPending(chatID)
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
-		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit)
+		albums, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, b.searchLanguage())
 		if err != nil {
 			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
 			return
@@ -3055,7 +3223,7 @@ func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
 	b.setPending(chatID, pending.Kind, pending.Query, newOffset, items, hasNext, pending.ReplyToMessageID, messageID)
 }
 
-func fetchArtistAlbums(storefront, artistID, token string, limit int) ([]SearchResultItem, error) {
+func fetchArtistAlbums(storefront, artistID, token string, limit int, language string) ([]SearchResultItem, error) {
 	offset := 0
 	items := []SearchResultItem{}
 	for {
@@ -3069,7 +3237,9 @@ func fetchArtistAlbums(storefront, artistID, token string, limit int) ([]SearchR
 		query := url.Values{}
 		query.Set("limit", "100")
 		query.Set("offset", strconv.Itoa(offset))
-		query.Set("l", Config.Language)
+		if language != "" {
+			query.Set("l", language)
+		}
 		req.URL.RawQuery = query.Encode()
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -3122,6 +3292,9 @@ func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, songID string, re
 		_ = b.sendMessage(chatID, "Song ID is empty.", nil)
 		return
 	}
+	if b.trySendCachedTrack(chatID, replyToID, songID) {
+		return
+	}
 	b.enqueueDownload(chatID, replyToID, true, func() error {
 		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken)
 	})
@@ -3172,6 +3345,18 @@ func (b *TelegramBot) enqueueDownload(chatID int64, replyToID int, single bool, 
 	if inProgress || queueLen > 0 {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued. Position: %d", position), nil, replyToID)
 	}
+}
+
+func (b *TelegramBot) trySendCachedTrack(chatID int64, replyToID int, trackID string) bool {
+	entry, ok := b.getCachedAudio(trackID, b.maxFileBytes)
+	if !ok {
+		return false
+	}
+	if err := b.sendAudioByFileID(chatID, entry, replyToID); err != nil {
+		b.deleteCachedAudio(trackID, entry.Compressed)
+		return false
+	}
+	return true
 }
 
 func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, replyToID int) {
@@ -3254,6 +3439,8 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	sendPath := filePath
 	displayName := filepath.Base(filePath)
 	thumbPath := ""
+	compressed := false
+	meta, hasMeta := getDownloadedMeta(filePath)
 	cleanup := func() {
 		if thumbPath != "" {
 			_ = os.Remove(thumbPath)
@@ -3274,6 +3461,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 			return err
 		}
 		sendPath = compressedPath
+		compressed = true
 		cleanup = func() {
 			_ = os.Remove(compressedPath)
 		}
@@ -3311,7 +3499,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 			return err
 		}
 	}
-	if meta, ok := getDownloadedMeta(filePath); ok {
+	if hasMeta {
 		if meta.Title != "" {
 			if err := writer.WriteField("title", meta.Title); err != nil {
 				return err
@@ -3359,12 +3547,21 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("telegram sendAudio failed: %s", resp.Status)
 	}
-	apiResp := apiResponse{}
+	apiResp := sendAudioResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return err
 	}
 	if !apiResp.OK {
 		return fmt.Errorf("telegram sendAudio error: %s", apiResp.Description)
+	}
+	if hasMeta && meta.TrackID != "" && apiResp.Result.Audio.FileID != "" {
+		b.storeCachedAudio(meta.TrackID, CachedAudio{
+			FileID:     apiResp.Result.Audio.FileID,
+			FileSize:   apiResp.Result.Audio.FileSize,
+			Compressed: compressed,
+			Title:      meta.Title,
+			Performer:  meta.Performer,
+		})
 	}
 	return nil
 }
@@ -3780,6 +3977,48 @@ func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, mark
 		return 0, fmt.Errorf("telegram sendMessage error: %s", apiResp.Description)
 	}
 	return apiResp.Result.MessageID, nil
+}
+
+func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyToID int) error {
+	payload := map[string]any{
+		"chat_id": chatID,
+		"audio":   entry.FileID,
+	}
+	if entry.Title != "" {
+		payload["title"] = entry.Title
+	}
+	if entry.Performer != "" {
+		payload["performer"] = entry.Performer
+	}
+	if replyToID > 0 {
+		payload["reply_to_message_id"] = replyToID
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", b.apiURL("sendAudio"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		responseBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("telegram sendAudio failed: %s", strings.TrimSpace(string(responseBody)))
+	}
+	apiResp := sendAudioResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return err
+	}
+	if !apiResp.OK {
+		return fmt.Errorf("telegram sendAudio error: %s", apiResp.Description)
+	}
+	return nil
 }
 
 func (b *TelegramBot) answerCallbackQuery(callbackID string) error {
