@@ -106,10 +106,11 @@ Notes:
    - `/search_album <keywords>`
    - `/search_artist <keywords>`
    - `/id <song|album> <id>`
+   - `/settings [alac|flac]`
 
 Notes:
-- The bot sends FLAC, so `ffmpeg` must be available.
-- Large files are re-encoded to fit `telegram-max-file-mb` (quality may be reduced).
+- The bot sends ALAC by default. Use `/settings flac` for FLAC output (requires `ffmpeg`).
+- Large files are re-encoded to fit `telegram-max-file-mb` in FLAC mode (quality may be reduced).
 - For localized search results, set `telegram-search-language` (e.g. `zh-Hans`) or the global `language`.
 - To enable instant re-sends, set `telegram-cache-file` so the bot can reuse Telegram file IDs.
 - Share buttons require enabling inline mode in BotFather.

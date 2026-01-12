@@ -66,10 +66,11 @@ docker run --rm -it \
    - `/search_album <关键词>`
    - `/search_artist <关键词>`
    - `/id <song|album> <id>`
+   - `/settings [alac|flac]`
 
 注意：
-- 机器人会发送 FLAC，需要系统有 `ffmpeg`。
-- 超过限制的文件会重新压缩到 `telegram-max-file-mb`（音质可能下降）。
+- 默认发送 ALAC，如需 FLAC 请使用 `/settings flac`（需要系统有 `ffmpeg`）。
+- 超过限制的文件会在 FLAC 模式下重新压缩到 `telegram-max-file-mb`（音质可能下降）。
 - 如需中文搜索结果，可设置 `telegram-search-language`（例如 `zh-Hans`）或全局 `language`。
 - 如需“秒传”复用 Telegram 缓存，可设置 `telegram-cache-file` 保存 file_id 缓存。
 - 分享按钮需要在 BotFather 中开启 inline 模式。
