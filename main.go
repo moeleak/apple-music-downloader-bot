@@ -2603,6 +2603,7 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 
 const (
 	defaultSearchLimit = 8
+	defaultQueueSize  = 20
 	pendingTTL         = 10 * time.Minute
 )
 
@@ -2617,7 +2618,9 @@ type TelegramBot struct {
 	pendingMu sync.Mutex
 	pending   map[int64]*PendingSelection
 
-	downloadSem chan struct{}
+	queueMu       sync.Mutex
+	downloadQueue chan *downloadRequest
+	inProgress    bool
 }
 
 type PendingSelection struct {
@@ -2629,6 +2632,13 @@ type PendingSelection struct {
 	CreatedAt        time.Time
 	ReplyToMessageID int
 	ResultsMessageID int
+}
+
+type downloadRequest struct {
+	chatID    int64
+	replyToID int
+	single    bool
+	fn        func() error
 }
 
 type Update struct {
@@ -2732,7 +2742,11 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	if maxFileBytes <= 0 {
 		maxFileBytes = 50 * 1024 * 1024
 	}
-	return &TelegramBot{
+	queueSize := defaultQueueSize
+	if queueSize <= 0 {
+		queueSize = 1
+	}
+	bot := &TelegramBot{
 		token:        token,
 		appleToken:   appleToken,
 		client:       &http.Client{Timeout: 60 * time.Second},
@@ -2740,8 +2754,10 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		searchLimit:  searchLimit,
 		maxFileBytes: maxFileBytes,
 		pending:      make(map[int64]*PendingSelection),
-		downloadSem:  make(chan struct{}, 1),
+		downloadQueue: make(chan *downloadRequest, queueSize),
 	}
+	bot.startDownloadWorker()
+	return bot
 }
 
 func (b *TelegramBot) loop() {
@@ -2764,6 +2780,22 @@ func (b *TelegramBot) loop() {
 			}
 		}
 	}
+}
+
+func (b *TelegramBot) startDownloadWorker() {
+	go func() {
+		for req := range b.downloadQueue {
+			b.queueMu.Lock()
+			b.inProgress = true
+			b.queueMu.Unlock()
+
+			b.runDownload(req.chatID, req.fn, req.single, req.replyToID)
+
+			b.queueMu.Lock()
+			b.inProgress = false
+			b.queueMu.Unlock()
+		}
+	}()
 }
 
 func (b *TelegramBot) handleMessage(msg *Message) {
@@ -3090,9 +3122,9 @@ func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, songID string, re
 		_ = b.sendMessage(chatID, "Song ID is empty.", nil)
 		return
 	}
-	go b.runDownload(chatID, func() error {
+	b.enqueueDownload(chatID, replyToID, true, func() error {
 		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken)
-	}, true, replyToID)
+	})
 }
 
 func (b *TelegramBot) queueDownloadAlbum(chatID int64, albumID string) {
@@ -3104,17 +3136,45 @@ func (b *TelegramBot) queueDownloadAlbumWithReply(chatID int64, albumID string, 
 		_ = b.sendMessage(chatID, "Album ID is empty.", nil)
 		return
 	}
-	go b.runDownload(chatID, func() error {
+	b.enqueueDownload(chatID, replyToID, false, func() error {
 		return ripAlbum(albumID, b.appleToken, Config.Storefront, Config.MediaUserToken, "")
-	}, false, replyToID)
+	})
+}
+
+func (b *TelegramBot) enqueueDownload(chatID int64, replyToID int, single bool, fn func() error) {
+	req := &downloadRequest{
+		chatID:    chatID,
+		replyToID: replyToID,
+		single:    single,
+		fn:        fn,
+	}
+	b.queueMu.Lock()
+	inProgress := b.inProgress
+	queueLen := len(b.downloadQueue)
+	queueCap := cap(b.downloadQueue)
+	position := queueLen + 1
+	if inProgress {
+		position++
+	}
+	queueFull := queueLen >= queueCap
+	b.queueMu.Unlock()
+
+	if queueFull {
+		_ = b.sendMessageWithReply(chatID, "Download queue is full. Please try again later.", nil, replyToID)
+		return
+	}
+	select {
+	case b.downloadQueue <- req:
+	default:
+		_ = b.sendMessageWithReply(chatID, "Download queue is full. Please try again later.", nil, replyToID)
+		return
+	}
+	if inProgress || queueLen > 0 {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued. Position: %d", position), nil, replyToID)
+	}
 }
 
 func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, replyToID int) {
-	if !b.tryAcquireDownload() {
-		_ = b.sendMessageWithReply(chatID, "Another download is in progress. Please try again shortly.", nil, replyToID)
-		return
-	}
-	defer b.releaseDownload()
 
 	lastDownloadedPaths = nil
 	downloadedMetaMu.Lock()
@@ -3892,22 +3952,6 @@ func (b *TelegramBot) clearPending(chatID int64) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	delete(b.pending, chatID)
-}
-
-func (b *TelegramBot) tryAcquireDownload() bool {
-	select {
-	case b.downloadSem <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-func (b *TelegramBot) releaseDownload() {
-	select {
-	case <-b.downloadSem:
-	default:
-	}
 }
 
 func parseCommand(text string) (string, []string, bool) {
