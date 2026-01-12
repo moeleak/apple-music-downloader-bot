@@ -2770,6 +2770,18 @@ type InlineQueryResultCachedAudio struct {
 	Caption     string `json:"caption,omitempty"`
 }
 
+type InlineQueryResultArticle struct {
+	Type                string              `json:"type"`
+	ID                  string              `json:"id"`
+	Title               string              `json:"title"`
+	Description         string              `json:"description,omitempty"`
+	InputMessageContent InputMessageContent `json:"input_message_content"`
+}
+
+type InputMessageContent struct {
+	MessageText string `json:"message_text"`
+}
+
 func runTelegramBot(appleToken string) {
 	botToken := strings.TrimSpace(Config.TelegramBotToken)
 	if botToken == "" {
@@ -3087,35 +3099,50 @@ func (b *TelegramBot) handleInlineQuery(q *InlineQuery) {
 	if q == nil || q.ID == "" {
 		return
 	}
-	if q.From != nil && !b.isAllowedChat(q.From.ID) {
-		return
-	}
 	query := strings.TrimSpace(q.Query)
 	if query == "" {
-		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
+		_ = b.answerInlineQuery(q.ID, []any{}, true)
 		return
 	}
-	trackID := strings.TrimSpace(query)
-	if strings.HasPrefix(strings.ToLower(trackID), "song:") {
-		trackID = strings.TrimSpace(trackID[5:])
-	}
+	trackID := extractInlineTrackID(query)
 	if trackID == "" {
-		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
+		_ = b.answerInlineQuery(q.ID, []any{}, true)
 		return
 	}
 	entry, ok := b.getCachedAudio(trackID, b.maxFileBytes)
-	if !ok {
-		_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{}, true)
-		return
+	results := []any{}
+	if ok {
+		entry = b.enrichCachedAudio(trackID, entry)
+		results = append(results, InlineQueryResultCachedAudio{
+			Type:        "audio",
+			ID:          fmt.Sprintf("song_%s", trackID),
+			AudioFileID: entry.FileID,
+			Caption:     formatTelegramCaption(entry.SizeBytes, entry.BitrateKbps),
+		})
+	} else {
+		meta, err := b.fetchTrackMeta(trackID)
+		title := "Send /songid " + trackID
+		description := ""
+		if err == nil {
+			if meta.Title != "" && meta.Performer != "" {
+				title = meta.Performer + " - " + meta.Title
+				description = "Send /songid " + trackID
+			} else if meta.Title != "" {
+				title = meta.Title
+				description = "Send /songid " + trackID
+			}
+		}
+		results = append(results, InlineQueryResultArticle{
+			Type:        "article",
+			ID:          fmt.Sprintf("songcmd_%s", trackID),
+			Title:       title,
+			Description: description,
+			InputMessageContent: InputMessageContent{
+				MessageText: "/songid " + trackID,
+			},
+		})
 	}
-	entry = b.enrichCachedAudio(trackID, entry)
-	result := InlineQueryResultCachedAudio{
-		Type:        "audio",
-		ID:          fmt.Sprintf("song_%s", trackID),
-		AudioFileID: entry.FileID,
-		Caption:     formatTelegramCaption(entry.SizeBytes, entry.BitrateKbps),
-	}
-	_ = b.answerInlineQuery(q.ID, []InlineQueryResultCachedAudio{result}, true)
+	_ = b.answerInlineQuery(q.ID, results, true)
 }
 
 func (b *TelegramBot) handleCommand(chatID int64, cmd string, args []string, replyToID int) {
@@ -3947,19 +3974,19 @@ func buildShareKeyboard(meta AudioMeta, fallback string) *InlineKeyboardMarkup {
 	if shareText == "" {
 		shareText = "Share"
 	}
-	query := "song:" + trackID
+	query := "/songid " + trackID
 	return &InlineKeyboardMarkup{
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{
 					Text:                         shareText,
-					SwitchInlineQueryCurrentChat: strPtr(query),
+					SwitchInlineQuery: strPtr(query),
 				},
 			},
 			{
 				{
 					Text:              "Send me to...",
-					SwitchInlineQuery: strPtr(query),
+					SwitchInlineQuery: strPtr(""),
 				},
 			},
 		},
@@ -3983,6 +4010,32 @@ func trimInlineText(text string, maxRunes int) string {
 
 func strPtr(value string) *string {
 	return &value
+}
+
+func extractInlineTrackID(query string) string {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "/songid") {
+		fields := strings.Fields(trimmed)
+		if len(fields) >= 2 {
+			return strings.TrimSpace(fields[1])
+		}
+		return ""
+	}
+	if strings.HasPrefix(lower, "songid") {
+		fields := strings.Fields(trimmed)
+		if len(fields) >= 2 {
+			return strings.TrimSpace(fields[1])
+		}
+		return ""
+	}
+	if strings.HasPrefix(lower, "song:") {
+		return strings.TrimSpace(trimmed[5:])
+	}
+	return strings.TrimSpace(trimmed)
 }
 
 func findCoverFile(dir string) string {
