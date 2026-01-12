@@ -3643,11 +3643,6 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		}
 	}
 	caption := formatTelegramCaption(sizeBytes, bitrateKbps)
-	var replyMarkup *InlineKeyboardMarkup
-	if hasMeta {
-		replyMarkup = buildShareKeyboard(meta, displayName)
-	}
-
 	if status != nil {
 		status.Update("Uploading", 0, 0)
 	}
@@ -3681,14 +3676,6 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		}
 		if meta.Performer != "" {
 			if err := writer.WriteField("performer", meta.Performer); err != nil {
-				return err
-			}
-		}
-	}
-	if replyMarkup != nil {
-		raw, err := json.Marshal(replyMarkup)
-		if err == nil {
-			if err := writer.WriteField("reply_markup", string(raw)); err != nil {
 				return err
 			}
 		}
@@ -3951,65 +3938,6 @@ func formatTelegramCaption(sizeBytes int64, bitrateKbps float64) string {
 		bitrateKbps = 0
 	}
 	return fmt.Sprintf("#AppleMusic #flac 文件大小%.2fMB %.2fkbps\nvia @ultimateapplemusicdownloaderbot", sizeMB, bitrateKbps)
-}
-
-func buildShareKeyboard(meta AudioMeta, fallback string) *InlineKeyboardMarkup {
-	trackID := strings.TrimSpace(meta.TrackID)
-	if trackID == "" {
-		return nil
-	}
-	title := strings.TrimSpace(meta.Title)
-	performer := strings.TrimSpace(meta.Performer)
-	shareText := ""
-	if performer != "" && title != "" {
-		shareText = performer + " - " + title
-	} else if title != "" {
-		shareText = title
-	} else if performer != "" {
-		shareText = performer
-	} else {
-		shareText = strings.TrimSpace(fallback)
-	}
-	shareText = trimInlineText(shareText, 64)
-	if shareText == "" {
-		shareText = "Share"
-	}
-	query := "/songid " + trackID
-	return &InlineKeyboardMarkup{
-		InlineKeyboard: [][]InlineKeyboardButton{
-			{
-				{
-					Text:                         shareText,
-					SwitchInlineQuery: strPtr(query),
-				},
-			},
-			{
-				{
-					Text:              "Send me to...",
-					SwitchInlineQuery: strPtr(""),
-				},
-			},
-		},
-	}
-}
-
-func trimInlineText(text string, maxRunes int) string {
-	text = strings.TrimSpace(text)
-	if maxRunes <= 0 || text == "" {
-		return text
-	}
-	runes := []rune(text)
-	if len(runes) <= maxRunes {
-		return text
-	}
-	if maxRunes <= 3 {
-		return string(runes[:maxRunes])
-	}
-	return string(runes[:maxRunes-3]) + "..."
-}
-
-func strPtr(value string) *string {
-	return &value
 }
 
 func extractInlineTrackID(query string) string {
@@ -4289,14 +4217,6 @@ func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyTo
 	}
 	if entry.Performer != "" {
 		payload["performer"] = entry.Performer
-	}
-	meta := AudioMeta{
-		TrackID:   trackID,
-		Title:     entry.Title,
-		Performer: entry.Performer,
-	}
-	if markup := buildShareKeyboard(meta, ""); markup != nil {
-		payload["reply_markup"] = markup
 	}
 	if replyToID > 0 {
 		payload["reply_to_message_id"] = replyToID
