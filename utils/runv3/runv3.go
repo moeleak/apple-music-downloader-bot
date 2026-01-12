@@ -339,21 +339,9 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 	}
 	body := extsong(fileurl, progress)
 	fmt.Print("Downloaded\n")
-	//bodyReader := bytes.NewReader(body)
-	var buffer bytes.Buffer
 
 	if progress != nil {
 		progress("Decrypting", 0, 0)
-	}
-	err = DecryptMP4(&body, keybt, &buffer)
-	if err != nil {
-		fmt.Print("Decryption failed\n")
-		return "", err
-	} else {
-		fmt.Print("Decrypted\n")
-	}
-	if progress != nil {
-		progress("Decrypting", 1, 1)
 	}
 	// create output file
 	ofh, err := os.Create(trackpath)
@@ -362,11 +350,14 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 		return "", err
 	}
 	defer ofh.Close()
-
-	_, err = ofh.Write(buffer.Bytes())
+	err = DecryptMP4(&body, keybt, ofh)
 	if err != nil {
-		fmt.Printf("写入文件失败: %v\n", err)
+		fmt.Print("Decryption failed\n")
 		return "", err
+	}
+	fmt.Print("Decrypted\n")
+	if progress != nil {
+		progress("Decrypting", 1, 1)
 	}
 	return "", nil
 }

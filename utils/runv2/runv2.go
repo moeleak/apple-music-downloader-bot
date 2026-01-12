@@ -114,7 +114,6 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	req.Header = header
 
 	var body io.Reader
-	usedDownloadProgress := false
 	client := &http.Client{Timeout: timeout}
 	if optstimeout > 0 {
 		// create the timer before calling Do so that the timeout covers TCP handshake,
@@ -137,42 +136,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 			return err
 		}
 		defer do.Body.Close()
-		if do.ContentLength < int64(Config.MaxMemoryLimit*1024*1024) {
-			var buffer bytes.Buffer
-			if progress != nil {
-				usedDownloadProgress = true
-				pw := &progressWriter{
-					cb:    progress,
-					phase: "Downloading",
-					total: do.ContentLength,
-				}
-				io.Copy(io.MultiWriter(&buffer, pw), do.Body)
-			} else {
-				bar := progressbar.NewOptions64(
-					do.ContentLength,
-					progressbar.OptionClearOnFinish(),
-					progressbar.OptionSetElapsedTime(false),
-					progressbar.OptionSetPredictTime(false),
-					progressbar.OptionShowElapsedTimeOnFinish(),
-					progressbar.OptionShowCount(),
-					progressbar.OptionEnableColorCodes(true),
-					progressbar.OptionShowBytes(true),
-					progressbar.OptionSetDescription("Downloading..."),
-					progressbar.OptionSetTheme(progressbar.Theme{
-						Saucer:        "",
-						SaucerHead:    "",
-						SaucerPadding: "",
-						BarStart:      "",
-						BarEnd:        "",
-					}),
-				)
-				io.Copy(io.MultiWriter(&buffer, bar), do.Body)
-				fmt.Print("Downloaded\n")
-			}
-			body = &buffer
-		} else {
-			body = do.Body
-		}
+		body = do.Body
 	}
 
 	var totalLen int64
@@ -187,11 +151,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	//fmt.Print("Decrypting...\n")
 	defer Close(conn)
 
-	phase := "Downloading"
-	if usedDownloadProgress {
-		phase = "Decrypting"
-	}
-	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config, progress, phase)
+	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config, progress, "Downloading")
 	if err != nil {
 		return err
 	}
@@ -201,20 +161,13 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 
 func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet, progress ProgressFunc, phase string) error {
-	var buffer bytes.Buffer
-	var outBuf *bufio.Writer
-	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
 	inBuf := bufio.NewReader(in)
-	if totalLen <= MaxMemorySize {
-		outBuf = bufio.NewWriter(&buffer)
-	} else {
-		ofh, err := os.Create(outfile)
-		if err != nil {
-			return err
-		}
-		defer ofh.Close()
-		outBuf = bufio.NewWriter(ofh)
+	ofh, err := os.Create(outfile)
+	if err != nil {
+		return err
 	}
+	defer ofh.Close()
+	outBuf := bufio.NewWriter(ofh)
 	init, offset, err := ReadInitSegment(inBuf)
 	if err != nil {
 		return err
@@ -317,19 +270,6 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 	err = outBuf.Flush()
 	if err != nil {
 		return err
-	}
-	if totalLen <= MaxMemorySize {
-		// create output file
-		ofh, err := os.Create(outfile)
-		if err != nil {
-			return err
-		}
-		defer ofh.Close()
-
-		_, err = ofh.Write(buffer.Bytes())
-		if err != nil {
-			return err
-		}
 	}
 	return nil
 }
