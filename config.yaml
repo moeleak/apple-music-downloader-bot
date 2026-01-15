@@ -62,9 +62,11 @@ convert-warn-lossy-to-lossless: true # If true, print a warning when converting 
 convert-skip-lossy-to-lossless: true # If true, skip converting detected lossy sources to lossless target formats (flac/wav)
 # Telegram bot settings
 telegram-bot-token: ""            # Bot token or set TELEGRAM_BOT_TOKEN
+telegram-api-url: ""              # Optional API base URL override (default: https://api.telegram.org)
 telegram-allowed-chat-ids: []     # Optional chat ID allowlist
 telegram-search-limit: 8          # Results per search
 telegram-search-language: ""      # Optional search language override (e.g. zh-Hans, zh-Hant)
 telegram-max-file-mb: 50          # Max file size to send
 telegram-download-folder: ""      # Optional override for downloads
 telegram-cache-file: ""           # Optional cache file for Telegram file_id reuse
+telegram-download-max-gb: 3        # Cleanup threshold for Telegram download folder

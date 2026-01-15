@@ -100,8 +100,9 @@ Notes:
 ## Telegram bot mode
 1. Set `telegram-bot-token` in `config.yaml` (or export `TELEGRAM_BOT_TOKEN`).
 2. Optional: set `telegram-allowed-chat-ids` to restrict usage.
-3. Start the bot: `go run main.go --bot`
-4. Commands:
+3. Optional: set `telegram-api-url` to override the Telegram API base URL.
+4. Start the bot: `go run main.go --bot`
+5. Commands:
    - `/search_song <keywords>`
    - `/search_album <keywords>`
    - `/search_artist <keywords>`
@@ -110,7 +111,7 @@ Notes:
 
 Notes:
 - The bot sends ALAC by default. Use `/settings flac` for FLAC output (requires `ffmpeg`).
-- If the download folder exceeds 10GB, older files are removed (Telegram cache remains).
+- If the download folder exceeds the limit, older files are removed (default 3GB; set `telegram-download-max-gb`, Telegram cache remains).
 - Large files are re-encoded to fit `telegram-max-file-mb` in FLAC mode (quality may be reduced).
 - For localized search results, set `telegram-search-language` (e.g. `zh-Hans`) or the global `language`.
 - To enable instant re-sends, set `telegram-cache-file` so the bot can reuse Telegram file IDs.

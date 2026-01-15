@@ -53,6 +53,8 @@ type ConfigSet struct {
 	TelegramMaxFileMB          int     `yaml:"telegram-max-file-mb"`
 	TelegramDownloadFolder     string  `yaml:"telegram-download-folder"`
 	TelegramCacheFile          string  `yaml:"telegram-cache-file"`
+	TelegramAPIURL             string  `yaml:"telegram-api-url"`
+	TelegramDownloadMaxGB      int     `yaml:"telegram-download-max-gb"`
 }
 
 type Counter struct {

@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	apputils "main/utils"
 	"main/utils/ampapi"
 	"main/utils/lyrics"
 	"main/utils/runv2"
@@ -29,7 +30,6 @@ import (
 	"main/utils/structs"
 	"main/utils/task"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
 	"github.com/grafov/m3u8"
 	"github.com/olekukonko/tablewriter"
@@ -483,24 +483,6 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// START: New functions for search functionality
-
-// SearchResultItem is a unified struct to hold search results for display.
-type SearchResultItem struct {
-	Type   string
-	Name   string
-	Detail string
-	URL    string
-	ID     string
-}
-
-// QualityOption holds information about a downloadable quality.
-type QualityOption struct {
-	ID          string
-	Description string
-}
-
-// setDlFlags configures the global download flags based on the user's quality selection.
 func setDlFlags(quality string) {
 	dl_atmos = false
 	dl_aac = false
@@ -518,323 +500,31 @@ func setDlFlags(quality string) {
 	}
 }
 
-// promptForQuality asks the user to select a download quality for the chosen media.
-func promptForQuality(item SearchResultItem, token string) (string, error) {
-	if item.Type == "Artist" {
-		fmt.Println("Artist selected. Proceeding to list all albums/videos.")
-		return "default", nil
-	}
-
-	fmt.Printf("\nFetching available qualities for: %s\n", item.Name)
-
-	qualities := []QualityOption{
-		{ID: "alac", Description: "Lossless (ALAC)"},
-		{ID: "aac", Description: "High-Quality (AAC)"},
-		{ID: "atmos", Description: "Dolby Atmos"},
-	}
-	qualityOptions := []string{}
-	for _, q := range qualities {
-		qualityOptions = append(qualityOptions, q.Description)
-	}
-
-	prompt := &survey.Select{
-		Message:  "Select a quality to download:",
-		Options:  qualityOptions,
-		PageSize: 5,
-	}
-
-	selectedIndex := 0
-	err := survey.AskOne(prompt, &selectedIndex)
+func handleSearch(searchType string, queryParts []string, token string) (string, error) {
+	selection, err := apputils.HandleSearch(searchType, queryParts, token, Config.Storefront, Config.Language)
 	if err != nil {
-		// This can happen if the user presses Ctrl+C
+		return "", err
+	}
+	if selection == nil || selection.URL == "" {
 		return "", nil
 	}
-
-	return qualities[selectedIndex].ID, nil
+	if selection.IsSong {
+		dl_song = true
+	}
+	if selection.Quality != "" && selection.Quality != "default" {
+		setDlFlags(selection.Quality)
+	}
+	return selection.URL, nil
 }
 
-// handleSearch manages the entire interactive search process.
-func handleSearch(searchType string, queryParts []string, token string) (string, error) {
-	query := strings.Join(queryParts, " ")
-	validTypes := map[string]bool{"album": true, "song": true, "artist": true}
-	if !validTypes[searchType] {
-		return "", fmt.Errorf("invalid search type: %s. Use 'album', 'song', or 'artist'", searchType)
-	}
-
-	fmt.Printf("Searching for %ss: \"%s\" in storefront \"%s\"\n", searchType, query, Config.Storefront)
-
-	offset := 0
-	limit := 15 // Increased limit for better navigation
-
-	apiSearchType := searchType + "s"
-
-	for {
-		searchResp, err := ampapi.Search(Config.Storefront, query, apiSearchType, Config.Language, token, limit, offset)
-		if err != nil {
-			return "", fmt.Errorf("error fetching search results: %w", err)
-		}
-
-		var items []SearchResultItem
-		var displayOptions []string
-		hasNext := false
-
-		// Special options for navigation
-		const prevPageOpt = "⬅️  Previous Page"
-		const nextPageOpt = "➡️  Next Page"
-
-		// Add previous page option if applicable
-		if offset > 0 {
-			displayOptions = append(displayOptions, prevPageOpt)
-		}
-
-		switch searchType {
-		case "album":
-			if searchResp.Results.Albums != nil {
-				for _, item := range searchResp.Results.Albums.Data {
-					year := ""
-					if len(item.Attributes.ReleaseDate) >= 4 {
-						year = item.Attributes.ReleaseDate[:4]
-					}
-					trackInfo := fmt.Sprintf("%d tracks", item.Attributes.TrackCount)
-					detail := fmt.Sprintf("%s (%s, %s)", item.Attributes.ArtistName, year, trackInfo)
-					displayOptions = append(displayOptions, fmt.Sprintf("%s - %s", item.Attributes.Name, detail))
-					items = append(items, SearchResultItem{Type: "Album", URL: item.Attributes.URL, ID: item.ID})
-				}
-				hasNext = searchResp.Results.Albums.Next != ""
-			}
-		case "song":
-			if searchResp.Results.Songs != nil {
-				for _, item := range searchResp.Results.Songs.Data {
-					detail := fmt.Sprintf("%s (%s)", item.Attributes.ArtistName, item.Attributes.AlbumName)
-					displayOptions = append(displayOptions, fmt.Sprintf("%s - %s", item.Attributes.Name, detail))
-					items = append(items, SearchResultItem{Type: "Song", URL: item.Attributes.URL, ID: item.ID})
-				}
-				hasNext = searchResp.Results.Songs.Next != ""
-			}
-		case "artist":
-			if searchResp.Results.Artists != nil {
-				for _, item := range searchResp.Results.Artists.Data {
-					detail := ""
-					if len(item.Attributes.GenreNames) > 0 {
-						detail = strings.Join(item.Attributes.GenreNames, ", ")
-					}
-					displayOptions = append(displayOptions, fmt.Sprintf("%s (%s)", item.Attributes.Name, detail))
-					items = append(items, SearchResultItem{Type: "Artist", URL: item.Attributes.URL, ID: item.ID})
-				}
-				hasNext = searchResp.Results.Artists.Next != ""
-			}
-		}
-
-		if len(items) == 0 && offset == 0 {
-			fmt.Println("No results found.")
-			return "", nil
-		}
-
-		// Add next page option if applicable
-		if hasNext {
-			displayOptions = append(displayOptions, nextPageOpt)
-		}
-
-		prompt := &survey.Select{
-			Message:  "Use arrow keys to navigate, Enter to select:",
-			Options:  displayOptions,
-			PageSize: limit, // Show a full page of results
-		}
-
-		selectedIndex := 0
-		err = survey.AskOne(prompt, &selectedIndex)
-		if err != nil {
-			// User pressed Ctrl+C
-			return "", nil
-		}
-
-		selectedOption := displayOptions[selectedIndex]
-
-		// Handle pagination
-		if selectedOption == nextPageOpt {
-			offset += limit
-			continue
-		}
-		if selectedOption == prevPageOpt {
-			offset -= limit
-			continue
-		}
-
-		// Adjust index to match the `items` slice if "Previous Page" was an option
-		itemIndex := selectedIndex
-		if offset > 0 {
-			itemIndex--
-		}
-
-		selectedItem := items[itemIndex]
-
-		// Automatically set single song download flag
-		if selectedItem.Type == "Song" {
-			dl_song = true
-		}
-
-		quality, err := promptForQuality(selectedItem, token)
-		if err != nil {
-			return "", fmt.Errorf("could not process quality selection: %w", err)
-		}
-		if quality == "" { // User cancelled quality selection
-			fmt.Println("Selection cancelled.")
-			return "", nil
-		}
-
-		if quality != "default" {
-			setDlFlags(quality)
-		}
-
-		return selectedItem.URL, nil
-	}
-}
-
-// END: New functions for search functionality
-
-// CONVERSION FEATURE: Determine if source codec is lossy (rough heuristic by extension/codec name).
-func isLossySource(ext string, codec string) bool {
-	ext = strings.ToLower(ext)
-	if ext == ".m4a" && (codec == "AAC" || strings.Contains(codec, "AAC") || strings.Contains(codec, "ATMOS")) {
-		return true
-	}
-	if ext == ".mp3" || ext == ".opus" || ext == ".ogg" {
-		return true
-	}
-	return false
-}
-
-// CONVERSION FEATURE: Build ffmpeg arguments for desired target.
-func buildFFmpegArgs(ffmpegPath, inPath, outPath, targetFmt, extraArgs string, coverPath string) ([]string, error) {
-	args := []string{"-y", "-i", inPath}
-	if coverPath != "" {
-		args = append(args, "-i", coverPath)
-	}
-	switch targetFmt {
-	case "flac":
-		if coverPath != "" {
-			args = append(args,
-				"-map", "0:a",
-				"-map", "1:v",
-				"-c:a", "flac",
-				"-c:v", "mjpeg",
-				"-disposition:v", "attached_pic",
-			)
-		} else {
-			args = append(args, "-map", "0:a", "-c:a", "flac")
-		}
-	case "mp3":
-		args = append(args, "-vn")
-		// VBR quality 2 ~ high quality
-		args = append(args, "-c:a", "libmp3lame", "-qscale:a", "2")
-	case "opus":
-		args = append(args, "-vn")
-		// Medium/high quality
-		args = append(args, "-c:a", "libopus", "-b:a", "192k", "-vbr", "on")
-	case "wav":
-		args = append(args, "-vn")
-		args = append(args, "-c:a", "pcm_s16le")
-	case "copy":
-		args = append(args, "-vn")
-		// Just container copy (probably pointless for same container)
-		args = append(args, "-c", "copy")
-	default:
-		return nil, fmt.Errorf("unsupported convert-format: %s", targetFmt)
-	}
-	if extraArgs != "" {
-		// naive split; for complex quoting you could enhance
-		args = append(args, strings.Fields(extraArgs)...)
-	}
-	args = append(args, outPath)
-	return args, nil
-}
-
-// CONVERSION FEATURE: Perform conversion if enabled.
-func convertIfNeeded(track *task.Track) {
-	if !Config.ConvertAfterDownload {
-		return
-	}
-	if Config.ConvertFormat == "" {
-		return
-	}
-	srcPath := track.SavePath
-	if srcPath == "" {
-		return
-	}
-	ext := strings.ToLower(filepath.Ext(srcPath))
-	targetFmt := strings.ToLower(Config.ConvertFormat)
-
-	// Map extension for output
-	if targetFmt == "copy" {
-		fmt.Println("Convert (copy) requested; skipping because it produces no new format.")
-		return
-	}
-
-	if Config.ConvertSkipIfSourceMatch {
-		if ext == "."+targetFmt {
-			fmt.Printf("Conversion skipped (already %s)\n", targetFmt)
-			return
-		}
-	}
-
-	outBase := strings.TrimSuffix(srcPath, ext)
-	outPath := outBase + "." + targetFmt
-
-	// Handle lossy -> lossless cases: optionally skip or warn
-	if (targetFmt == "flac" || targetFmt == "wav") && isLossySource(ext, track.Codec) {
-		if Config.ConvertSkipLossyToLossless {
-			fmt.Println("Skipping conversion: source appears lossy and target is lossless; configured to skip.")
-			return
-		}
-		if Config.ConvertWarnLossyToLossless {
-			fmt.Println("Warning: Converting lossy source to lossless container will not improve quality.")
-		}
-	}
-
-	if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
-		fmt.Printf("ffmpeg not found at '%s'; skipping conversion.\n", Config.FFmpegPath)
-		return
-	}
-
-	if activeProgress != nil {
-		activeProgress("Converting", 0, 0)
-	}
+func convertIfNeeded(track *task.Track, lrc string) {
 	coverPath := ""
-	if targetFmt == "flac" && track.SaveDir != "" {
+	if strings.EqualFold(Config.ConvertFormat, "flac") && track.SaveDir != "" {
 		coverPath = findCoverFile(track.SaveDir)
 	}
-	args, err := buildFFmpegArgs(Config.FFmpegPath, srcPath, outPath, targetFmt, Config.ConvertExtraArgs, coverPath)
-	if err != nil {
-		fmt.Println("Conversion config error:", err)
-		return
-	}
-
-	fmt.Printf("Converting -> %s ...\n", targetFmt)
-	cmd := exec.Command(Config.FFmpegPath, args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	start := time.Now()
-	if err := cmd.Run(); err != nil {
-		fmt.Println("Conversion failed:", err)
-		// leave original
-		return
-	}
-	fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
-
-	if !Config.ConvertKeepOriginal {
-		if err := os.Remove(srcPath); err != nil {
-			fmt.Println("Failed to remove original after conversion:", err)
-		} else {
-			track.SavePath = outPath
-			track.SaveName = filepath.Base(outPath)
-			fmt.Println("Original removed.")
-		}
-	} else {
-		// Keep both but point track to new file (optional decision)
-		track.SavePath = outPath
-		track.SaveName = filepath.Base(outPath)
-	}
+	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, activeProgress)
 }
+
 
 func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	var err error
@@ -994,10 +684,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 					track.SavePath = convertedPath
 					track.SaveName = filepath.Base(convertedPath)
 				} else {
-					convertIfNeeded(track)
+					convertIfNeeded(track, lrc)
 				}
 			} else {
-				convertIfNeeded(track)
+				convertIfNeeded(track, lrc)
 			}
 		}
 		recordDownloadedTrack(track)
@@ -1086,7 +776,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 
 	// CONVERSION FEATURE hook
-	convertIfNeeded(track)
+	convertIfNeeded(track, lrc)
 
 	recordDownloadedTrack(track)
 	counter.Success++
@@ -2628,7 +2318,7 @@ const (
 	defaultQueueSize  = 20
 	pendingTTL         = 10 * time.Minute
 	defaultTelegramFormat = "alac"
-	telegramDownloadMaxBytes int64 = 10 * 1024 * 1024 * 1024
+	defaultTelegramDownloadMaxGB = 3
 )
 
 const (
@@ -2638,6 +2328,7 @@ const (
 
 type TelegramBot struct {
 	token        string
+	apiBase      string
 	appleToken   string
 	client       *http.Client
 	allowedChats map[int64]bool
@@ -2665,7 +2356,7 @@ type PendingSelection struct {
 	Title            string
 	Offset           int
 	HasNext          bool
-	Items            []SearchResultItem
+	Items            []apputils.SearchResultItem
 	CreatedAt        time.Time
 	ReplyToMessageID int
 	ResultsMessageID int
@@ -2813,6 +2504,22 @@ func runTelegramBot(appleToken string) {
 	bot.loop()
 }
 
+func normalizeTelegramAPIBase(raw string) string {
+	base := strings.TrimSpace(raw)
+	if base == "" {
+		return "https://api.telegram.org"
+	}
+	return strings.TrimRight(base, "/")
+}
+
+func telegramDownloadMaxBytes() int64 {
+	gb := Config.TelegramDownloadMaxGB
+	if gb <= 0 {
+		gb = defaultTelegramDownloadMaxGB
+	}
+	return int64(gb) * 1024 * 1024 * 1024
+}
+
 func newTelegramBot(token, appleToken string) *TelegramBot {
 	allowed := make(map[int64]bool)
 	for _, id := range Config.TelegramAllowedChatIDs {
@@ -2834,15 +2541,17 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	if queueSize <= 0 {
 		queueSize = 1
 	}
+	apiBase := normalizeTelegramAPIBase(Config.TelegramAPIURL)
 	bot := &TelegramBot{
-		token:        token,
-		appleToken:   appleToken,
-		client:       &http.Client{Timeout: 60 * time.Second},
-		allowedChats: allowed,
-		searchLimit:  searchLimit,
-		maxFileBytes: maxFileBytes,
-		chatFormats:  make(map[int64]string),
-		pending:      make(map[int64]*PendingSelection),
+		token:         token,
+		apiBase:       apiBase,
+		appleToken:    appleToken,
+		client:        &http.Client{Timeout: 60 * time.Second},
+		allowedChats:  allowed,
+		searchLimit:   searchLimit,
+		maxFileBytes:  maxFileBytes,
+		chatFormats:   make(map[int64]string),
+		pending:       make(map[int64]*PendingSelection),
 		downloadQueue: make(chan *downloadRequest, queueSize),
 		cacheFile:     cacheFile,
 		cache:         make(map[string]CachedAudio),
@@ -3378,7 +3087,7 @@ func (b *TelegramBot) handleSearch(chatID int64, kind string, query string, repl
 		_ = b.sendMessageWithReply(chatID, "No results found.", nil, replyToID)
 		return
 	}
-	message := formatSearchResults(kind, query, items)
+	message := apputils.FormatSearchResults(kind, query, items)
 	messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(items), offset > 0, hasNext), replyToID)
 	if err != nil {
 		return
@@ -3394,71 +3103,14 @@ func (b *TelegramBot) searchLanguage() string {
 	return lang
 }
 
-func (b *TelegramBot) fetchSearchPage(kind string, query string, offset int) ([]SearchResultItem, bool, error) {
+func (b *TelegramBot) fetchSearchPage(kind string, query string, offset int) ([]apputils.SearchResultItem, bool, error) {
 	apiType := kind + "s"
 	resp, err := ampapi.Search(Config.Storefront, query, apiType, b.searchLanguage(), b.appleToken, b.searchLimit, offset)
 	if err != nil {
 		return nil, false, err
 	}
-	items, hasNext := buildSearchItems(kind, resp)
+	items, hasNext := apputils.BuildSearchItems(kind, resp)
 	return items, hasNext, nil
-}
-
-func buildSearchItems(kind string, resp *ampapi.SearchResp) ([]SearchResultItem, bool) {
-	items := []SearchResultItem{}
-	hasNext := false
-	switch kind {
-	case "song":
-		if resp.Results.Songs == nil {
-			return items, false
-		}
-		for _, item := range resp.Results.Songs.Data {
-			detail := fmt.Sprintf("%s / %s", item.Attributes.ArtistName, item.Attributes.AlbumName)
-			items = append(items, SearchResultItem{
-				Type:   "Song",
-				Name:   item.Attributes.Name,
-				Detail: detail,
-				URL:    item.Attributes.URL,
-				ID:     item.ID,
-			})
-		}
-		hasNext = resp.Results.Songs.Next != ""
-	case "album":
-		if resp.Results.Albums == nil {
-			return items, false
-		}
-		for _, item := range resp.Results.Albums.Data {
-			year := ""
-			if len(item.Attributes.ReleaseDate) >= 4 {
-				year = item.Attributes.ReleaseDate[:4]
-			}
-			detail := fmt.Sprintf("%s (%s, %d tracks)", item.Attributes.ArtistName, year, item.Attributes.TrackCount)
-			items = append(items, SearchResultItem{
-				Type:   "Album",
-				Name:   item.Attributes.Name,
-				Detail: detail,
-				URL:    item.Attributes.URL,
-				ID:     item.ID,
-			})
-		}
-		hasNext = resp.Results.Albums.Next != ""
-	case "artist":
-		if resp.Results.Artists == nil {
-			return items, false
-		}
-		for _, item := range resp.Results.Artists.Data {
-			detail := strings.Join(item.Attributes.GenreNames, ", ")
-			items = append(items, SearchResultItem{
-				Type:   "Artist",
-				Name:   item.Attributes.Name,
-				Detail: detail,
-				URL:    item.Attributes.URL,
-				ID:     item.ID,
-			})
-		}
-		hasNext = resp.Results.Artists.Next != ""
-	}
-	return items, hasNext
 }
 
 func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
@@ -3487,7 +3139,7 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 	case "album", "artist_album":
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
 	case "artist":
-		albums, hasNext, err := fetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, 0, b.searchLanguage())
+		albums, hasNext, err := apputils.FetchArtistAlbums(Config.Storefront, selected.ID, b.appleToken, b.searchLimit, 0, b.searchLanguage())
 		if err != nil {
 			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
 			return
@@ -3496,7 +3148,7 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 			_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
 			return
 		}
-		message := formatArtistAlbums(selected.Name, albums)
+		message := apputils.FormatArtistAlbums(selected.Name, albums)
 		messageID, err := b.sendMessageWithReplyReturn(chatID, message, buildInlineKeyboard(len(albums), false, hasNext), replyToID)
 		if err != nil {
 			return
@@ -3523,7 +3175,7 @@ func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
 		return
 	}
 	var (
-		items   []SearchResultItem
+		items   []apputils.SearchResultItem
 		hasNext bool
 		err     error
 		message string
@@ -3538,9 +3190,9 @@ func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
 		if len(items) == 0 {
 			return
 		}
-		message = formatSearchResults(pending.Kind, pending.Query, items)
+		message = apputils.FormatSearchResults(pending.Kind, pending.Query, items)
 	case "artist_album":
-		items, hasNext, err = fetchArtistAlbums(Config.Storefront, pending.Query, b.appleToken, b.searchLimit, newOffset, b.searchLanguage())
+		items, hasNext, err = apputils.FetchArtistAlbums(Config.Storefront, pending.Query, b.appleToken, b.searchLimit, newOffset, b.searchLanguage())
 		if err != nil {
 			_ = b.editMessageText(chatID, messageID, fmt.Sprintf("Failed to load artist albums: %v", err), nil)
 			return
@@ -3548,83 +3200,12 @@ func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
 		if len(items) == 0 {
 			return
 		}
-		message = formatArtistAlbums(pending.Title, items)
+		message = apputils.FormatArtistAlbums(pending.Title, items)
 	default:
 		return
 	}
 	_ = b.editMessageText(chatID, messageID, message, buildInlineKeyboard(len(items), newOffset > 0, hasNext))
 	b.setPending(chatID, pending.Kind, pending.Query, newOffset, items, hasNext, pending.ReplyToMessageID, messageID, pending.Title)
-}
-
-func fetchArtistAlbums(storefront, artistID, token string, limit int, pageOffset int, language string) ([]SearchResultItem, bool, error) {
-	apiOffset := 0
-	items := []SearchResultItem{}
-	for {
-		req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s/albums", storefront, artistID), nil)
-		if err != nil {
-			return nil, false, err
-		}
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-		req.Header.Set("Origin", "https://music.apple.com")
-		query := url.Values{}
-		query.Set("limit", "100")
-		query.Set("offset", strconv.Itoa(apiOffset))
-		if language != "" {
-			query.Set("l", language)
-		}
-		req.URL.RawQuery = query.Encode()
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, false, err
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, false, fmt.Errorf("artist albums request failed: %s", resp.Status)
-		}
-		obj := new(structs.AutoGeneratedArtist)
-		if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
-			resp.Body.Close()
-			return nil, false, err
-		}
-		resp.Body.Close()
-		for _, album := range obj.Data {
-			items = append(items, SearchResultItem{
-				Type:   "Album",
-				Name:   album.Attributes.Name,
-				Detail: album.Attributes.ReleaseDate,
-				URL:    album.Attributes.URL,
-				ID:     album.ID,
-			})
-		}
-		if obj.Next == "" {
-			break
-		}
-		apiOffset += 100
-	}
-	sort.Slice(items, func(i, j int) bool {
-		di, err1 := time.Parse("2006-01-02", items[i].Detail)
-		dj, err2 := time.Parse("2006-01-02", items[j].Detail)
-		if err1 != nil || err2 != nil {
-			return items[i].Name < items[j].Name
-		}
-		return di.After(dj)
-	})
-	if pageOffset < 0 {
-		pageOffset = 0
-	}
-	if limit <= 0 {
-		return items, false, nil
-	}
-	if pageOffset >= len(items) {
-		return []SearchResultItem{}, false, nil
-	}
-	end := pageOffset + limit
-	if end > len(items) {
-		end = len(items)
-	}
-	hasNext := end < len(items)
-	return items[pageOffset:end], hasNext, nil
 }
 
 func (b *TelegramBot) queueDownloadSong(chatID int64, songID string) {
@@ -3819,14 +3400,15 @@ func (b *TelegramBot) cleanupDownloadsIfNeeded() {
 		fmt.Printf("Download folder scan failed: %v\n", err)
 		return
 	}
-	if totalSize <= telegramDownloadMaxBytes {
+	maxBytes := telegramDownloadMaxBytes()
+	if totalSize <= maxBytes {
 		return
 	}
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].modTime.Before(files[j].modTime)
 	})
 	for _, entry := range files {
-		if totalSize <= telegramDownloadMaxBytes {
+		if totalSize <= maxBytes {
 			break
 		}
 		if err := os.Remove(entry.path); err != nil {
@@ -4722,7 +4304,7 @@ func (b *TelegramBot) getUpdates(offset int) ([]Update, error) {
 }
 
 func (b *TelegramBot) apiURL(method string) string {
-	return fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.token, method)
+	return fmt.Sprintf("%s/bot%s/%s", b.apiBase, b.token, method)
 }
 
 func (b *TelegramBot) isAllowedChat(chatID int64) bool {
@@ -4732,7 +4314,7 @@ func (b *TelegramBot) isAllowedChat(chatID int64) bool {
 	return b.allowedChats[chatID]
 }
 
-func (b *TelegramBot) setPending(chatID int64, kind string, query string, offset int, items []SearchResultItem, hasNext bool, replyToID int, resultsMessageID int, title string) {
+func (b *TelegramBot) setPending(chatID int64, kind string, query string, offset int, items []apputils.SearchResultItem, hasNext bool, replyToID int, resultsMessageID int, title string) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	b.pending[chatID] = &PendingSelection{
@@ -4774,32 +4356,6 @@ func parseCommand(text string) (string, []string, bool) {
 		cmd = cmd[:idx]
 	}
 	return strings.ToLower(cmd), parts[1:], true
-}
-
-func formatSearchResults(kind, query string, items []SearchResultItem) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Search %s: %s\n", kind, query))
-	for i, item := range items {
-		if item.Detail != "" {
-			b.WriteString(fmt.Sprintf("%d. %s - %s\n", i+1, item.Name, item.Detail))
-		} else {
-			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, item.Name))
-		}
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func formatArtistAlbums(artistName string, items []SearchResultItem) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Albums by %s:\n", artistName))
-	for i, item := range items {
-		if item.Detail != "" {
-			b.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, item.Name, item.Detail))
-		} else {
-			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, item.Name))
-		}
-	}
-	return strings.TrimSpace(b.String())
 }
 
 func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMarkup {
