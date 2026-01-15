@@ -3914,66 +3914,86 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 		}
 	}
 
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
-		return err
-	}
-	if replyToID > 0 {
-		if err := writer.WriteField("reply_to_message_id", strconv.Itoa(replyToID)); err != nil {
-			return err
-		}
-	}
-	if caption != "" {
-		if err := writer.WriteField("caption", caption); err != nil {
-			return err
-		}
-	}
-	if hasMeta {
-		if meta.Title != "" {
-			if err := writer.WriteField("title", meta.Title); err != nil {
-				return err
-			}
-		}
-		if meta.Performer != "" {
-			if err := writer.WriteField("performer", meta.Performer); err != nil {
-				return err
-			}
-		}
-	}
-	part, err := writer.CreateFormFile("audio", displayName)
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	contentType := writer.FormDataContentType()
+	writeErrCh := make(chan error, 1)
+
+	req, err := http.NewRequest("POST", b.apiURL("sendAudio"), pr)
 	if err != nil {
+		_ = pw.CloseWithError(err)
 		return err
 	}
-	if _, err := io.Copy(part, file); err != nil {
-		return err
-	}
-	if thumbPath != "" {
-		thumbFile, err := os.Open(thumbPath)
-		if err == nil {
-			defer thumbFile.Close()
-			thumbPart, err := writer.CreateFormFile("thumbnail", filepath.Base(thumbPath))
-			if err == nil {
-				if _, err := io.Copy(thumbPart, thumbFile); err != nil {
+	req.Header.Set("Content-Type", contentType)
+	go func() {
+		err := func() error {
+			if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+				return err
+			}
+			if replyToID > 0 {
+				if err := writer.WriteField("reply_to_message_id", strconv.Itoa(replyToID)); err != nil {
 					return err
 				}
 			}
+			if caption != "" {
+				if err := writer.WriteField("caption", caption); err != nil {
+					return err
+				}
+			}
+			if hasMeta {
+				if meta.Title != "" {
+					if err := writer.WriteField("title", meta.Title); err != nil {
+						return err
+					}
+				}
+				if meta.Performer != "" {
+					if err := writer.WriteField("performer", meta.Performer); err != nil {
+						return err
+					}
+				}
+			}
+			part, err := writer.CreateFormFile("audio", displayName)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(part, file); err != nil {
+				return err
+			}
+			if thumbPath != "" {
+				thumbFile, err := os.Open(thumbPath)
+				if err == nil {
+					defer thumbFile.Close()
+					thumbPart, err := writer.CreateFormFile("thumbnail", filepath.Base(thumbPath))
+					if err == nil {
+						if _, err := io.Copy(thumbPart, thumbFile); err != nil {
+							return err
+						}
+					}
+				}
+			}
+			return writer.Close()
+		}()
+		if err != nil {
+			_ = pw.CloseWithError(err)
+		} else {
+			_ = pw.Close()
 		}
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("POST", b.apiURL("sendAudio"), &body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+		writeErrCh <- err
+	}()
 	resp, err := b.client.Do(req)
 	if err != nil {
+		_ = pw.CloseWithError(err)
+		writeErr := <-writeErrCh
+		if writeErr != nil {
+			return writeErr
+		}
 		return err
 	}
 	defer resp.Body.Close()
+	writeErr := <-writeErrCh
+	if writeErr != nil {
+		return writeErr
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("telegram sendAudio failed: %s", resp.Status)
 	}
