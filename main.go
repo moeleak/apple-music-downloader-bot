@@ -58,6 +58,8 @@ var (
 	activeProgress func(phase string, done, total int64)
 	downloadedMetaMu sync.Mutex
 	downloadedMeta   = make(map[string]AudioMeta)
+	searchMetaMu     sync.Mutex
+	searchMetaByID   = make(map[string]AudioMeta)
 )
 
 type AudioMeta struct {
@@ -111,6 +113,16 @@ func recordDownloadedTrack(track *task.Track) {
 		Performer: strings.TrimSpace(track.Resp.Attributes.ArtistName),
 		DurationMillis: int64(track.Resp.Attributes.DurationInMillis),
 	}
+	if meta.TrackID != "" {
+		if override, ok := popSearchMeta(meta.TrackID); ok {
+			if override.Title != "" {
+				meta.Title = override.Title
+			}
+			if override.Performer != "" {
+				meta.Performer = override.Performer
+			}
+		}
+	}
 	if meta.Title != "" || meta.Performer != "" {
 		downloadedMetaMu.Lock()
 		downloadedMeta[track.SavePath] = meta
@@ -122,6 +134,34 @@ func getDownloadedMeta(path string) (AudioMeta, bool) {
 	downloadedMetaMu.Lock()
 	defer downloadedMetaMu.Unlock()
 	meta, ok := downloadedMeta[path]
+	return meta, ok
+}
+
+func setSearchMeta(trackID string, title string, performer string) {
+	trackID = strings.TrimSpace(trackID)
+	if trackID == "" {
+		return
+	}
+	meta := AudioMeta{
+		TrackID:   trackID,
+		Title:     strings.TrimSpace(title),
+		Performer: strings.TrimSpace(performer),
+	}
+	if meta.Title == "" && meta.Performer == "" {
+		return
+	}
+	searchMetaMu.Lock()
+	searchMetaByID[trackID] = meta
+	searchMetaMu.Unlock()
+}
+
+func popSearchMeta(trackID string) (AudioMeta, bool) {
+	searchMetaMu.Lock()
+	defer searchMetaMu.Unlock()
+	meta, ok := searchMetaByID[trackID]
+	if ok {
+		delete(searchMetaByID, trackID)
+	}
 	return meta, ok
 }
 
@@ -3135,6 +3175,7 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 	selected := pending.Items[choice-1]
 	switch pending.Kind {
 	case "song":
+		setSearchMeta(selected.ID, selected.Name, selected.Artist)
 		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID)
 	case "album", "artist_album":
 		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID)
