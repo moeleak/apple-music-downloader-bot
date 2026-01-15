@@ -80,6 +80,15 @@ func songGroupKey(item SearchResultItem) string {
 	name := strings.TrimSpace(item.Name)
 	artist := strings.TrimSpace(item.Artist)
 	album := strings.TrimSpace(item.Album)
+	if name == "" && artist == "" && album == "" {
+		if item.ID != "" {
+			return "id:" + item.ID
+		}
+		if item.URL != "" {
+			return "url:" + item.URL
+		}
+		return ""
+	}
 	return strings.ToLower(name + "|" + artist + "|" + album)
 }
 
@@ -98,19 +107,33 @@ func sortSongVariants(items []SearchResultItem) {
 	if len(items) < 2 {
 		return
 	}
-	i := 0
-	for i < len(items) {
-		key := songGroupKey(items[i])
-		j := i + 1
-		for j < len(items) && songGroupKey(items[j]) == key {
-			j++
+	groups := make([][]SearchResultItem, 0, len(items))
+	index := make(map[string]int)
+	for _, item := range items {
+		key := songGroupKey(item)
+		if key == "" {
+			groups = append(groups, []SearchResultItem{item})
+			continue
 		}
-		if j-i > 1 {
-			sort.SliceStable(items[i:j], func(a, b int) bool {
-				return ratingRank(items[i+a].ContentRating) < ratingRank(items[i+b].ContentRating)
+		if idx, ok := index[key]; ok {
+			groups[idx] = append(groups[idx], item)
+		} else {
+			index[key] = len(groups)
+			groups = append(groups, []SearchResultItem{item})
+		}
+	}
+
+	pos := 0
+	for _, group := range groups {
+		if len(group) > 1 {
+			sort.SliceStable(group, func(i, j int) bool {
+				return ratingRank(group[i].ContentRating) < ratingRank(group[j].ContentRating)
 			})
 		}
-		i = j
+		for _, item := range group {
+			items[pos] = item
+			pos++
+		}
 	}
 }
 

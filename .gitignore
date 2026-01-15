@@ -6,5 +6,8 @@
 !go.sum
 !main.go
 !README.md
+!.github/
+!.github/workflows/
+!.github/workflows/*
 !utils/
 !utils/*
